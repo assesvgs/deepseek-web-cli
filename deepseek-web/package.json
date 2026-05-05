@@ -1,0 +1,6 @@
+{
+  "name": "deepseek-web-plugin",
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  }
+}
