@@ -57,6 +57,7 @@ type ParseEvent =
 // ============ 第3部分：常量 ============
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const IS_ANDROID = process.platform === "android";
 const CRED_FILE = path.join(__dirname, "credentials.json");
 
 // WASM base64（从 wasm-embedded.ts 拷贝）
@@ -103,10 +104,6 @@ function readFileIfExists(filePath: string): string {
     }
   } catch {}
   return "";
-}
-
-function isRealSessionId(id: string): boolean {
-  return id !== "";
 }
 
 // ============ 第5部分：PowSolver ============
@@ -625,22 +622,32 @@ class SessionStore {
     if (currentId === id) this.setCurrentId("");
   }
 
-  list(): { id: string; title: string; rounds: number; updatedAt: number; forkedFrom?: string }[] {
+  list(): { id: string; title: string; rounds: number; updatedAt: number; forkedFrom?: string; forkedFromTitle?: string }[] {
     const dir = this.sessionsDir;
     if (!fs.existsSync(dir)) return [];
-    const result: { id: string; title: string; rounds: number; updatedAt: number; forkedFrom?: string }[] = [];
+    const result: { id: string; title: string; rounds: number; updatedAt: number; forkedFrom?: string; forkedFromTitle?: string }[] = [];
     const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "_current");
     for (const file of files) {
       const filePath = path.join(dir, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-        result.push({
+        const item: any = {
           id: data.id || file.replace(".json", ""),
           title: data.title || "新会话",
           rounds: Math.ceil((data.messages?.length || 0) / 2),
           updatedAt: data.updatedAt || 0,
-          forkedFrom: data.forkedFrom,
-        });
+        };
+        if (data.forkedFrom) {
+          item.forkedFrom = data.forkedFrom;
+          // 获取原始会话标题
+          try {
+            const orig = JSON.parse(fs.readFileSync(this.sessionFile(data.forkedFrom), "utf-8"));
+            item.forkedFromTitle = orig.title || data.forkedFrom.slice(0, 8);
+          } catch {
+            item.forkedFromTitle = data.forkedFrom.slice(0, 8);
+          }
+        }
+        result.push(item);
       } catch {
         console.warn(`⚠️ 跳过损坏文件: ${file}`);
       }
@@ -1055,7 +1062,7 @@ function scanDeepseekDir(workDir: string): {
 // ============ 第14部分：登录与凭证管理 ============
 
 function openInChrome(url: string): void {
-  if (process.platform === "android") {
+  if (IS_ANDROID) {
     try {
       execSync(
         `am start -a android.intent.action.VIEW -d "${url}"` +
@@ -1069,6 +1076,10 @@ function openInChrome(url: string): void {
 async function loginDeepseek(
   onProgress: (msg: string) => void
 ): Promise<Credentials> {
+  // 平台伪装：支持在 Termux/Android 上运行 Playwright
+  if (process.platform === "android") {
+    Object.defineProperty(process, "platform", { value: "linux" });
+  }
   const CDP_URL = "http://127.0.0.1:9222";
   let chromium: any;
   try {
@@ -1334,10 +1345,10 @@ async function handleCommand(
         // 交互式：显示列表让用户选择
         const list = ctx.store.list();
         if (list.length === 0) { log("暂无保存的会话"); return session; }
-        log("请输入要切换的会话序号：\n");
+        log("请输入要切换的会话序号，或 q 退出：\n");
         list.forEach((s, i) => {
-          const fork = s.forkedFrom ? `, fork 自 ${s.forkedFrom}` : "";
-          log(`   [${i + 1}] ${s.id} - ${s.title} (${s.rounds} 轮${fork})`);
+          log(`   [${i + 1}] ${s.id} - ${s.title} (${s.rounds} 轮)`);
+          if (s.forkedFrom) log(`        ↳ fork 自 [${s.forkedFrom.slice(0, 8)}] ${s.forkedFromTitle || ""}`);
         });
         return ("LOAD_INTERACTIVE") as any;
       }
@@ -1351,7 +1362,7 @@ async function handleCommand(
         const list = ctx.store.list();
         if (list.length === 0) log("  暂无保存的会话");
         else list.forEach((s, i) => {
-          const fork = s.forkedFrom ? ` (fork 自 ${s.forkedFrom})` : "";
+          const fork = s.forkedFrom ? `, fork 自 ${s.forkedFrom.slice(0, 8)}` : "";
           log(`   ${i + 1}  ID: ${s.id}  ·  ${s.title}  ·  ${s.rounds} 轮${fork}`);
         });
         log("请输入 /load <id> 切换");
@@ -1450,7 +1461,7 @@ async function handleCommand(
 
     case "s": case "save": {
       if (!session) { log("❌ 没有活跃会话"); return session; }
-      if (!session.sessionId) { log("ℹ️ 会话尚未创建（首次发送消息后自动创建）"); return session; }
+      if (!session.sessionId) { log("💡 会话尚未创建（首次发送消息后自动创建）"); return session; }
       session.save();
       log(`✅ 已保存会话`);
       log(`   标题：${session.title || "新会话"}`);
@@ -1618,35 +1629,39 @@ async function handleCommand(
 
     case "?": case "h": case "help": {
       log("📖 DeepSeek Web CLI 帮助\n");
-      log("会话:");
-      log("  /new  [标题]    创建新会话");
-      log("  /load <id>      切换会话");
-      log("  /ls             列出所有会话");
-      log("  /del [id|--all] 删除会话");
-      log("  /p   <id>       手动覆盖续接点");
-      log("  /f   [id] [标题] 分叉新会话");
-      log("  /s              手动保存");
-      log("  /history        查看历史 [-r N, -a, -id <id>, on, off]");
-      log("\n提示词:");
-      log("  /sys            查看/管理提示词 [-c, -f <path>, -l]");
-      log("  /rj             重新注入提示词 [-new, -keep]");
+      log("会话管理:");
+      log("  /new  [标题]      创建新会话");
+      log("  /load [id]        切换会话（无参数时交互式选择，输 q 退出）");
+      log("  /list, /ls        列出所有会话（ID、标题、轮数、时间、fork 信息）");
+      log("  /del  [id|--all]  删除会话（无参数时交互式，输入序号/a/q）");
+      log("  /parent <id>, /p  手动覆盖续接点（需确认）");
+      log("  /fork [id] [标题], /f  分叉新会话");
+      log("  /save, /s         手动保存当前会话");
+      log("  /history          查看历史 [-r N 最近N轮] [-a 全部] [-id <id> 指定会话] [on/off 开关自动打印]");
+      log("\n提示词管理:");
+      log("  /system, /sys     查看当前提示词状态");
+      log("  /sys -c           清除局部提示词（回退到全局）");
+      log("  /sys -f <path>    从文件加载为全局提示词");
+      log("  /sys -f <path> -l 从文件加载为局部提示词");
+      log("  /reinject, /rj    重新注入提示词 [-new 重置父消息] [-keep 保持续接]");
       log("\n工具:");
-      log("  /t             列出可用工具");
+      log("  /tools, /t        列出可用工具（read/write/exec）");
+      log("  /tool  on/off     切换工具模式（开启后 AI 可使用工具）");
       log("\n凭证:");
-      log("  /auth          查看凭证状态 [-s 验证]");
-      log("  /reauth        重新登录");
-      log("\n模式:");
-      log("  /think [on|off] 切换思考模式");
-      log("  /search [on|off] 切换联网搜索");
-      log("  /tool [on|off]  切换工具模式");
-      log("  /raw           切换原始 SSE");
+      log("  /auth             查看凭证状态（脱敏显示）");
+      log("  /auth  -s         发送 API 请求验证凭证有效性");
+      log("  /reauth           重新登录获取凭证（覆盖式）");
+      log("\n模式切换:");
+      log("  /think [on/off]   切换思考模式（默认关，提示符显示 🧠）");
+      log("  /search [on/off]  切换联网搜索（默认开，提示符显示 🔍）");
+      log("  /raw              切换原始 SSE 数据流（调试用）");
       log("\n系统:");
-      log("  /?, /h         帮助");
-      log("  /q             退出");
-      log("  /clear         清屏");
-      log("  /cd <path>     切换工作目录");
-      log("  /pwd           当前工作目录");
-      log("  !<cmd>         Shell 透传");
+      log("  /?, /h            显示本帮助");
+      log("  /quit, /q         退出（需确认 y/n）");
+      log("  /clear            清屏");
+      log("  /cd <path>        切换工作目录（自动发现提示词和会话）");
+      log("  /pwd              显示当前工作目录");
+      log("  !<cmd>            Shell 透传（如 !ls, !echo）");
       return session;
     }
 
@@ -1672,7 +1687,7 @@ async function handleCommand(
     }
 
     case "pwd": {
-      log(ctx.workDir);
+      log(`📂 当前工作目录：${ctx.workDir}`);
       return session;
     }
 
@@ -1724,38 +1739,6 @@ function getPrompt(session: ChatSession | null): string {
   const thinkIcon = session.thinkEnabled ? " 🧠" : "";
   const searchIcon = session["state"].searchEnabled ? " 🔍" : "";
   return `💬 ${title}${thinkIcon}${searchIcon} > `;
-}
-
-function printHelp(): void {
-  console.log("📖 DeepSeek Web CLI 帮助\n");
-  console.log("会话:");
-  console.log("  /new  [标题]    创建新会话");
-  console.log("  /load <id>      切换会话");
-  console.log("  /ls             列出所有会话");
-  console.log("  /del [id|--all] 删除会话");
-  console.log("  /p   <id>       手动覆盖续接点");
-  console.log("  /f   [id] [标题] 分叉新会话");
-  console.log("  /s              手动保存");
-  console.log("  /history        查看历史 [-r N, -a, -id <id>, on, off]");
-  console.log("\n提示词:");
-  console.log("  /sys            查看/管理提示词 [-c, -f <path>, -l]");
-  console.log("  /rj             重新注入提示词 [-new, -keep]");
-  console.log("\n工具:");
-  console.log("  /t             列出可用工具");
-  console.log("\n凭证:");
-  console.log("  /auth          查看凭证状态 [-s 验证]");
-  console.log("  /reauth        重新登录");
-  console.log("\n模式:");
-  console.log("  /think [on/off] 切换思考模式");
-  console.log("  /search [on/off] 切换联网搜索");
-  console.log("  /tool [on/off]  切换工具模式");
-  console.log("  /raw           切换原始 SSE");
-  console.log("\n系统:");
-  console.log("  /?, /h         帮助");
-  console.log("  /q             退出");
-  console.log("  /clear         清屏");
-  console.log("  /pwd           当前工作目录");
-  console.log("  !<cmd>         Shell 透传");
 }
 
 function switchWorkspace(
@@ -1893,7 +1876,8 @@ async function startRepl(): Promise<void> {
     const idx = parseInt(trimmed, 10);
     const list = store.list();
     if (isNaN(idx) || idx < 1 || idx > list.length) {
-      console.log("❌ 无效序号，请输入序号 / all / q");
+      console.log("❌ 无效输入，请输入序号、或 a（全部删除）、或 q（退出）");
+      rl.prompt();
       return;
     }
     const target = list[idx - 1];
@@ -2064,40 +2048,53 @@ async function startRepl(): Promise<void> {
     // 加载子模式
     if (loadSubMode) {
       const input = line.trim();
-      if (input === "q" || input === "/q") {
+      // / 开头的输入当作命令处理，退出子模式
+      if (input.startsWith("/")) {
+        loadSubMode = false;
+        // 不做 return，让后续命令处理器接管
+      } else if (input === "q") {
         loadSubMode = false;
         console.log("已退出加载模式");
         rl.prompt();
         return;
-      }
-      const idx = parseInt(input, 10);
-      const list = store.list();
-      if (isNaN(idx) || idx < 1 || idx > list.length) {
-        console.log("❌ 无效序号");
+      } else {
+        const idx = parseInt(input, 10);
+        const list = store.list();
+        if (isNaN(idx) || idx < 1 || idx > list.length) {
+          console.log("❌ 无效序号");
+          loadSubMode = false;
+          rl.setPrompt(getPrompt(session));
+          rl.prompt();
+          return;
+        }
+        const target = list[idx - 1];
+        if (session) { session.abort(); session.save(); }
+        const loaded = ChatSession.load(target.id, ctx.client, ctx.store, ctx.promptBuilder, ctx.toolExecutor);
+        if (loaded) {
+          loaded.setRl(rl);
+          ctx.store.setCurrentId(loaded.sessionId);
+          session = loaded;
+          console.log(`📎 已切换到：${loaded.sessionId} - ${loaded.title} (${loaded.messageCount} 轮)`);
+        }
+        loadSubMode = false;
+        rl.setPrompt(getPrompt(session));
+        console.log("");
         rl.prompt();
         return;
       }
-      const target = list[idx - 1];
-      if (session) { session.abort(); session.save(); }
-      const loaded = ChatSession.load(target.id, ctx.client, ctx.store, ctx.promptBuilder, ctx.toolExecutor);
-      if (loaded) {
-        loaded.setRl(rl);
-        ctx.store.setCurrentId(loaded.sessionId);
-        session = loaded;
-        console.log(`📎 已切换到：${loaded.sessionId} - ${loaded.title} (${loaded.messageCount} 轮)`);
-      }
-      loadSubMode = false;
-      rl.setPrompt(getPrompt(session));
-      console.log("");
-      rl.prompt();
-      return;
     }
 
     // 删除子模式
     if (deleteSubMode) {
-      await handleDeleteInput(line);
-      rl.prompt();
-      return;
+      // / 开头的输入当作命令处理，退出子模式
+      if (line.trim().startsWith("/")) {
+        deleteSubMode = false;
+        // 不做 return，让后续命令处理器接管
+      } else {
+        await handleDeleteInput(line);
+        rl.prompt();
+        return;
+      }
     }
 
     const trimmed = line.trim();
