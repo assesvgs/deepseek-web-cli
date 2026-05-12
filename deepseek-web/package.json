@@ -1,6 +1,5 @@
 {
-  "name": "deepseek-web-plugin",
   "dependencies": {
-    "@opencode-ai/plugin": "latest"
+    "playwright-core": "^1.60.0"
   }
 }

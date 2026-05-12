@@ -1,0 +1,9 @@
+node_modules/
+credentials.json
+.deepseek/
+.DS_Store
+*.log
+/tmp/
+/dist/
+openclaw-zero-token/
+1/
