@@ -106,6 +106,250 @@ function readFileIfExists(filePath: string): string {
   return "";
 }
 
+// ============ 第4B部分：Hashline 编辑核心 ============
+
+const HL_PREFIX = "#HL"
+const fileRevCache = new Map<string, string>()
+
+function hlHash(text: string, length: number): string {
+  return crypto.createHash("sha1").update(text, "utf8").digest("hex").slice(0, length).toUpperCase()
+}
+
+function getHashLength(totalLines: number): number {
+  return totalLines > 4096 ? 4 : 3
+}
+
+function lineHash(line: string, length: number): string {
+  return hlHash(line, length)
+}
+
+function anchorHash(prevLine: string | undefined, line: string, nextLine: string | undefined, length: number): string {
+  return hlHash(`${prevLine ?? ""}\u241E${line}\u241E${nextLine ?? ""}`, length)
+}
+
+function fileRev(raw: string): string {
+  const normalized = raw.includes("\r\n") ? raw.replace(/\r\n/g, "\n") : raw
+  return hlHash(normalized, 8)
+}
+
+function formatRev(rev: string): string {
+  return `REV:${rev}`
+}
+
+function formatRef(lineNum: number, hash: string, anchor?: string): string {
+  return anchor ? `${lineNum}#${hash}#${anchor}` : `${lineNum}#${hash}`
+}
+
+function formatAnnotatedLine(line: string, idx: number, lines: string[]): string {
+  const len = getHashLength(Math.max(1, lines.length))
+  return `${HL_PREFIX} ${formatRef(idx + 1, lineHash(line, len), anchorHash(lines[idx - 1], line, lines[idx + 1], len))}|${line}`
+}
+
+function annotateReadOutput(raw: string, filePath: string): string {
+  const normalized = raw.includes("\r\n") ? raw.replace(/\r\n/g, "\n") : raw
+  const endsWithNewline = normalized.endsWith("\n")
+  let lines = normalized.split("\n")
+  if (endsWithNewline && lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+
+  const rev = fileRev(raw)
+  fileRevCache.set(path.resolve(filePath), rev)
+
+  const parts: string[] = []
+  parts.push(`<hashline-file path="${filePath}" total_lines="${lines.length}">`)
+  parts.push("# format: <line>#<hash>#<anchor>|<content>")
+  parts.push("# use refs exactly as shown in hashline edit/patch tools")
+  parts.push(`${HL_PREFIX} ${formatRev(rev)}`)
+  for (let i = 0; i < lines.length; i++) {
+    parts.push(formatAnnotatedLine(lines[i], i, lines))
+  }
+  parts.push("</hashline-file>")
+  return parts.join("\n")
+}
+
+function parseLineRef(refStr: string): { lineNum: number; hash: string; anchor?: string } {
+  const text = refStr.trim().replace(/^(?:#HL|;;;)\s*/i, "")
+  const beforePipe = text.split("|")[0].trim()
+  const match = beforePipe.match(/^(\d+)\s*[#: ]\s*([A-Za-z0-9]+)(?:\s*[#: ]\s*([A-Za-z0-9]+))?$/)
+  if (!match) throw new Error(`Invalid line reference "${refStr}". Expected <line>#<hash> or <line>#<hash>#<anchor>`)
+  return { lineNum: parseInt(match[1], 10), hash: match[2].toUpperCase(), anchor: match[3]?.toUpperCase() }
+}
+
+function findRefCandidates(parsed: ReturnType<typeof parseLineRef>, lines: string[], hashLen: number): number[] {
+  const found: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (lineHash(lines[i], hashLen) !== parsed.hash) continue
+    if (parsed.anchor && anchorHash(lines[i - 1], lines[i], lines[i + 1], hashLen) !== parsed.anchor) continue
+    found.push(i)
+  }
+  return found
+}
+
+function resolveLineRef(ref: string, lines: string[], safeReapply: boolean): number {
+  const parsed = parseLineRef(ref)
+  if (parsed.lineNum > lines.length) {
+    throw new Error(`Reference ${ref} points to line ${parsed.lineNum}, but file only has ${lines.length} lines`)
+  }
+
+  const hashLen = getHashLength(lines.length)
+  const idx = parsed.lineNum - 1
+  const actual = lines[idx]
+  const actualHash = lineHash(actual, hashLen)
+  const actualAnchor = anchorHash(lines[idx - 1], actual, lines[idx + 1], hashLen)
+
+  if (actualHash !== parsed.hash || (parsed.anchor && actualAnchor !== parsed.anchor)) {
+    if (safeReapply) {
+      const candidates = findRefCandidates(parsed, lines, hashLen)
+      if (candidates.length === 1) return candidates[0]
+      if (candidates.length > 1) {
+        throw new Error(`Hash mismatch; multiple relocation candidates (${candidates.map(c => c + 1).join(", ")}). Read the file again.`)
+      }
+      throw new Error("Hash mismatch; no relocation candidates found. Read the file again.")
+    }
+    const expected = parsed.anchor ? `${parsed.lineNum}#${parsed.hash}#${parsed.anchor}` : `${parsed.lineNum}#${parsed.hash}`
+    const actualRef = `${parsed.lineNum}#${actualHash}#${actualAnchor}`
+    throw new Error(`Hash mismatch for line ${parsed.lineNum}. Expected ${expected}, actual ${actualRef}. Read the file again.`)
+  }
+  return idx
+}
+
+interface HlOperation {
+  op: "replace" | "delete" | "insert_before" | "insert_after" | "replace_range" | "set_file"
+  ref?: string
+  startRef?: string
+  endRef?: string
+  content?: string
+}
+
+interface ResolvedChange {
+  spliceStart: number
+  deleteCount: number
+  insertLines: string[]
+  order: number
+  label: string
+}
+
+function splitToLines(content: string): string[] {
+  const n = content.replace(/\r\n/g, "\n")
+  if (!n) return []
+  const parts = n.split("\n")
+  if (n.endsWith("\n") && parts.length > 0) parts.pop()
+  return parts
+}
+
+function resolveChanges(lines: string[], ops: HlOperation[], safeReapply: boolean): ResolvedChange[] {
+  if (ops.length === 0) throw new Error("No operations provided")
+
+  const setFileCount = ops.filter(o => o.op === "set_file").length
+  if (setFileCount > 0 && ops.length > 1) throw new Error("set_file cannot be combined with other operations")
+
+  return ops.map((op, order): ResolvedChange => {
+    switch (op.op) {
+      case "replace": {
+        if (op.content === undefined) throw new Error("replace requires content")
+        const s = resolveLineRef(op.startRef ?? op.ref!, lines, safeReapply)
+        const e = op.endRef ? resolveLineRef(op.endRef, lines, safeReapply) : s
+        if (s > e) throw new Error("replace startRef must be <= endRef")
+        return { spliceStart: s, deleteCount: e - s + 1, insertLines: splitToLines(op.content), order, label: `replace(${op.startRef ?? op.ref}${op.endRef ? ".." + op.endRef : ""})` }
+      }
+      case "delete": {
+        const s = resolveLineRef(op.startRef ?? op.ref!, lines, safeReapply)
+        const e = op.endRef ? resolveLineRef(op.endRef, lines, safeReapply) : s
+        if (s > e) throw new Error("delete startRef must be <= endRef")
+        return { spliceStart: s, deleteCount: e - s + 1, insertLines: [], order, label: `delete(${op.startRef ?? op.ref}${op.endRef ? ".." + op.endRef : ""})` }
+      }
+      case "insert_before": {
+        if (op.content === undefined) throw new Error("insert_before requires content")
+        const s = resolveLineRef(op.startRef ?? op.ref!, lines, safeReapply)
+        return { spliceStart: s, deleteCount: 0, insertLines: splitToLines(op.content), order, label: `insert_before(${op.startRef ?? op.ref})` }
+      }
+      case "insert_after": {
+        if (op.content === undefined) throw new Error("insert_after requires content")
+        const e = resolveLineRef(op.endRef ?? op.startRef ?? op.ref!, lines, safeReapply)
+        return { spliceStart: e + 1, deleteCount: 0, insertLines: splitToLines(op.content), order, label: `insert_after(${op.endRef ?? op.startRef ?? op.ref})` }
+      }
+      case "replace_range": {
+        if (!op.startRef || !op.endRef) throw new Error("replace_range requires startRef and endRef")
+        if (op.content === undefined) throw new Error("replace_range requires content")
+        const s = resolveLineRef(op.startRef, lines, safeReapply)
+        const e = resolveLineRef(op.endRef, lines, safeReapply)
+        if (s > e) throw new Error("replace_range startRef must be <= endRef")
+        return { spliceStart: s, deleteCount: e - s + 1, insertLines: splitToLines(op.content), order, label: `replace_range(${op.startRef}..${op.endRef})` }
+      }
+      case "set_file": {
+        if (op.content === undefined) throw new Error("set_file requires content")
+        return { spliceStart: 0, deleteCount: lines.length, insertLines: splitToLines(op.content), order, label: "set_file" }
+      }
+      default:
+        throw new Error(`Unsupported operation: ${(op as any).op}`)
+    }
+  })
+}
+
+function validateNoOverlap(changes: ResolvedChange[]): void {
+  const taken = new Map<number, string>()
+  for (const c of changes) {
+    if (c.deleteCount === 0) continue
+    for (let i = c.spliceStart; i < c.spliceStart + c.deleteCount; i++) {
+      const existing = taken.get(i)
+      if (existing) throw new Error(`Overlapping operations: ${c.label} conflicts with ${existing}`)
+      taken.set(i, c.label)
+    }
+  }
+}
+
+function applyChanges(lines: string[], changes: ResolvedChange[]): string[] {
+  const result = [...lines]
+  const ordered = [...changes].sort((a, b) => {
+    if (a.spliceStart !== b.spliceStart) return b.spliceStart - a.spliceStart
+    return b.order - a.order
+  })
+  for (const c of ordered) {
+    result.splice(c.spliceStart, c.deleteCount, ...c.insertLines)
+  }
+  return result
+}
+
+function applyHashlineEdit(filePath: string, raw: string, ops: HlOperation[], rev?: string, safeReapply?: boolean): string {
+  if (rev) {
+    const currentRev = fileRev(raw)
+    if (currentRev !== rev.toUpperCase()) {
+      throw new Error(`File revision mismatch for ${filePath}. Expected ${rev.toUpperCase()}, actual ${currentRev}. Read the file again.`)
+    }
+  }
+
+  const normalized = raw.includes("\r\n") ? raw.replace(/\r\n/g, "\n") : raw
+  const endsWithNewline = normalized.endsWith("\n")
+  let lines = normalized.split("\n")
+  if (endsWithNewline && lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+
+  for (const op of ops) {
+    if (op.content) op.content = stripHashlineAnnotations(op.content)
+  }
+
+  const changes = resolveChanges(lines, ops, safeReapply ?? false)
+  validateNoOverlap(changes)
+  const newLines = applyChanges(lines, changes)
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n"
+  const result = newLines.length === 0 ? "" : newLines.join(eol) + (endsWithNewline ? eol : "")
+  fileRevCache.delete(path.resolve(filePath))
+  return result
+}
+
+function stripHashlineAnnotations(content: string): string {
+  const wrapperRe = /^<\/?hashline-file\b/i
+  const commentRe = /^#\s*(format|use refs|skipped|truncated)/i
+  const revRe = /^#HL\s*REV:[A-F0-9]{8}$/i
+  const refRe = /^([+\- ]?)#HL\s+\d+#[A-F0-9]+(?:#[A-F0-9]+)?\|/
+  return content
+    .split("\n")
+    .filter(l => !wrapperRe.test(l.trim()) && !commentRe.test(l.trim()) && !revRe.test(l.trim()))
+    .map(l => {
+      const m = l.match(refRe)
+      return m ? (m[1] ?? "") + l.slice(m[0].length) : l
+    })
+    .join("\n")
+}
+
 // ============ 第5部分：PowSolver ============
 
 class PowSolver {
@@ -716,7 +960,7 @@ class ToolExecutor {
     if (!tool) return `Error: Unknown tool: ${name}`;
 
     // 写操作需要确认
-    if (name === "write" || name === "exec") {
+    if (name === "write" || name === "exec" || name === "edit") {
       if (rl) rl.pause();
       try {
         const confirmed = await this.askConfirm(`⚠️ 确认执行 ${name}？(y/n) `);
@@ -732,11 +976,26 @@ class ToolExecutor {
   private runTool(name: string, args: Record<string, unknown>): string {
     try {
       switch (name) {
-        case "read":
-          return fs.readFileSync(args.path as string, "utf-8");
-        case "write":
-          fs.writeFileSync(args.path as string, args.content as string);
+        case "read": {
+          const raw = fs.readFileSync(args.path as string, "utf-8");
+          return annotateReadOutput(raw, args.path as string);
+        }
+        case "write": {
+          const clean = stripHashlineAnnotations(args.content as string);
+          fs.writeFileSync(args.path as string, clean);
+          fileRevCache.delete(path.resolve(args.path as string));
           return "success";
+        }
+        case "edit": {
+          const filePath = args.filePath as string;
+          const raw = fs.readFileSync(filePath, "utf-8");
+          const ops = (args.operations ?? []) as HlOperation[];
+          const rev = args.fileRev as string | undefined;
+          const safe = args.safeReapply as boolean | undefined;
+          const result = applyHashlineEdit(filePath, raw, ops, rev, safe);
+          fs.writeFileSync(filePath, result);
+          return `Edit applied: ${ops.length} operation(s)`;
+        }
         case "exec":
           return execSync(args.command as string, {
             encoding: "utf-8",
@@ -764,6 +1023,16 @@ function registerBuiltinTools(registry: ToolRegistry): void {
     parameters: {
       path: { type: "string", description: "File path" },
       content: { type: "string", description: "Content to write" },
+    },
+  });
+  registry.register({
+    name: "edit",
+    description: "Edit a file using hashline refs from read output. Args: filePath, operations (array of {op, startRef?, endRef?, ref?, content?}), fileRev?, safeReapply?. Ops: replace/delete/insert_before/insert_after/replace_range. use refs exactly as shown in read output.",
+    parameters: {
+      filePath: { type: "string", description: "Path to the file" },
+      operations: { type: "string", description: "JSON array of operations with startRef/endRef from read output" },
+      fileRev: { type: "string", description: "REV token from read output to detect stale edits" },
+      safeReapply: { type: "string", description: "Allow relocating refs if hash matches but line moved" },
     },
   });
   registry.register({
@@ -825,6 +1094,13 @@ class ChatSession {
   get searchEnabled(): boolean { return this.state.searchEnabled; }
   get parentMessageId(): number | null { return this.state.parentMessageId; }
   get messageCount(): number { return this.state.messages.length; }
+  get reinjectMode(): "new" | "keep" | null { return this.reinjectMode; }
+  get messages(): MessageRecord[] { return this.state.messages; }
+  set messages(v: MessageRecord[]) { this.state.messages = v; }
+  get forkedFrom(): string | undefined { return this.state.forkedFrom; }
+  set forkedFrom(v: string | undefined) { this.state.forkedFrom = v; }
+  setId(id: string): void { this.state.id = id; }
+  touch(): void { this.state.updatedAt = Date.now(); }
 
   setThinkEnabled(v: boolean): void { this.state.thinkEnabled = v; }
   setSearchEnabled(v: boolean): void { this.state.searchEnabled = v; }
@@ -1314,11 +1590,18 @@ type ReplCtx = {
   rawMode: boolean;
 };
 
+type CommandResult =
+  | { type: "session"; value: ChatSession | null }
+  | { type: "quit" }
+  | { type: "load_interactive" }
+  | { type: "confirm"; action: string; id?: string; newId?: number; mode?: string }
+  | { type: "cd_switched"; dir: string }
+
 async function handleCommand(
   line: string,
   session: ChatSession | null,
   ctx: ReplCtx
-): Promise<ChatSession | null> {
+): Promise<ChatSession | null | CommandResult> {
   const parts = line.slice(1).trim().split(/\s+/);
   const cmd = parts[0];
   const args = parts.slice(1);
@@ -1334,7 +1617,7 @@ async function handleCommand(
       const env = scanDeepseekDir(ctx.workDir);
       session.setSystemPrompt(env.systemPrompt);
       // 不自动注入工具提示词，避免干扰内置搜索
-      // session.setToolsPrompt(ctx.toolRegistry.buildToolPrompt());
+
       log(`✅ 已创建新会话${title ? ` ${title}` : ""}`);
       return session;
     }
@@ -1350,7 +1633,7 @@ async function handleCommand(
           log(`   [${i + 1}] ${s.id} - ${s.title} (${s.rounds} 轮)`);
           if (s.forkedFrom) log(`        ↳ fork 自 [${s.forkedFrom.slice(0, 8)}] ${s.forkedFromTitle || ""}`);
         });
-        return ("LOAD_INTERACTIVE") as any;
+        return { type: "load_interactive" } as CommandResult;
       }
       if (session) {
         session.abort();
@@ -1400,7 +1683,7 @@ async function handleCommand(
         const target = ctx.store.load(id);
         if (!target) { log(`❌ 未找到会话 ${id}`); return session; }
         log(`⚠️ 确认删除会话 ${id} - ${target.title}？(y/n)`);
-        return ("DEL_CONFIRM:" + id) as any;
+        return { type: "confirm", action: "DEL_SINGLE", id } as CommandResult;
       }
       // 无参数：返回标志给 REPL 进入删除子模式
       return session;
@@ -1412,7 +1695,7 @@ async function handleCommand(
       const newId = parseInt(id, 10);
       if (isNaN(newId)) { log("❌ id 必须是数字"); return session; }
       log(`⚠️ 续接点将被修改 (原: ${session.parentMessageId} → 新: ${newId})，确认？(y/n)`);
-      return "PARENT_CONFIRM:" + newId as any;
+      return { type: "confirm", action: "PARENT", newId } as CommandResult;
     }
 
     case "f": case "fork": {
@@ -1424,7 +1707,7 @@ async function handleCommand(
       const title = args.slice(forkId !== undefined ? 1 : 0).join(" ") || undefined;
 
       // 构建历史文本
-      const messages = session["state"].messages;
+      const messages = session.messages;
       const stopIdx = forkId !== undefined ? messages.findIndex((m: MessageRecord) => m.messageId === forkId) + 1 : messages.length;
       const historyParts: string[] = [];
       let i = 0;
@@ -1438,13 +1721,13 @@ async function handleCommand(
       try {
         const forkSession = ChatSession.create(ctx.client, ctx.store, ctx.promptBuilder, ctx.toolExecutor, title);
         // 注入历史到新会话
-        forkSession["state"].messages = messages.slice(0, stopIdx);
-        forkSession["state"].forkedFrom = session.sessionId;
-        if (!title && session.title) forkSession["state"].title = `${session.title} - 分支`;
+        forkSession.messages = messages.slice(0, stopIdx);
+        forkSession.forkedFrom = session.sessionId;
+        if (!title && session.title) forkSession.setTitle(`${session.title} - 分支`);
 
         const newId = await ctx.client.createChatSession();
-        forkSession["state"].id = newId;
-        forkSession["state"].parentMessageId = null;
+        forkSession.setId(newId);
+        forkSession.setParentMessageId(null);
 
         // 新会话首轮注入历史
         const env = scanDeepseekDir(ctx.workDir);
@@ -1474,7 +1757,7 @@ async function handleCommand(
       if (args[0] === "off") { log("🔇 自动打印：关"); return session; }
       if (args[0] === "on") { log("🔊 自动打印：开"); return session; }
       const targetSession = args.includes("-id") ? ctx.store.load(args[args.indexOf("-id") + 1]) : null;
-      const msgs = targetSession ? targetSession.messages : (session ? session["state"].messages : []);
+      const msgs = targetSession ? targetSession.messages : (session ? session.messages : []);
       const showAll = args.includes("-a");
       const rIdx = args.indexOf("-r");
       const range = rIdx !== -1 ? parseInt(args[rIdx + 1], 10) || 2 : (parseInt(args[0], 10) || (showAll ? msgs.length : 2));
@@ -1502,7 +1785,7 @@ async function handleCommand(
             log("✅ 已清除局部提示词\n   当前无任何系统提示词生效");
           }
         } else {
-          log("ℹ️ 局部提示词不存在，无需清除");
+          log("💡 局部提示词不存在，无需清除");
         }
       } else if (args[0] === "-f") {
         const srcPath = args[1];
@@ -1540,9 +1823,9 @@ async function handleCommand(
       if (!session) { log("❌ 没有活跃会话"); return session; }
       const mode = args[0] === "-new" ? "new" : args[0] === "-keep" ? "keep" : null;
       if (!mode) { log("❌ 用法: /rj -new 或 /rj -keep"); return session; }
-      if (session["reinjectMode"]) {
-        log(`⚠️ 已有待注入提示词（模式：${session["reinjectMode"]}），确认覆盖？(y/n)`);
-        return ("REINJECT_CONFIRM:" + mode) as any;
+      if (session.reinjectMode) {
+        log(`⚠️ 已有待注入提示词（模式：${session.reinjectMode}），确认覆盖？(y/n)`);
+        return { type: "confirm", action: "REINJECT", mode } as CommandResult;
       }
       session.setReinjectMode(mode);
       const env = scanDeepseekDir(ctx.workDir);
@@ -1573,7 +1856,7 @@ async function handleCommand(
       if (!session) { log("❌ 没有活跃会话"); return session; }
       if (args[0] === "on") { session.setSearchEnabled(true); log("🔍 联网搜索：开"); }
       else if (args[0] === "off") { session.setSearchEnabled(false); log("🔍 联网搜索：关"); }
-      else { session.setSearchEnabled(!session["state"].searchEnabled); log(`🔍 联网搜索：${session["state"].searchEnabled ? "开" : "关"}`); }
+      else { session.setSearchEnabled(!session.searchEnabled); log(`🔍 联网搜索：${session.searchEnabled ? "开" : "关"}`); }
       return session;
     }
 
@@ -1645,7 +1928,7 @@ async function handleCommand(
       log("  /sys -f <path> -l 从文件加载为局部提示词");
       log("  /reinject, /rj    重新注入提示词 [-new 重置父消息] [-keep 保持续接]");
       log("\n工具:");
-      log("  /tools, /t        列出可用工具（read/write/exec）");
+      log("  /tools, /t        列出可用工具（read/write/edit/exec）");
       log("  /tool  on/off     切换工具模式（开启后 AI 可使用工具）");
       log("\n凭证:");
       log("  /auth             查看凭证状态（脱敏显示）");
@@ -1666,7 +1949,7 @@ async function handleCommand(
     }
 
     case "q": case "quit": {
-      return "QUIT_REQUESTED" as any;
+      return { type: "quit" } as CommandResult;
     }
 
     case "clear": {
@@ -1679,7 +1962,7 @@ async function handleCommand(
       if (!dir) { log("❌ 用法: /cd <路径>"); return session; }
       try {
         process.chdir(dir);
-        return ("CD_SWITCHED:" + process.cwd()) as any;
+        return { type: "cd_switched", dir: process.cwd() } as CommandResult;
       } catch (err: any) {
         log(`❌ 切换失败: ${err.message}`);
       }
@@ -1737,7 +2020,7 @@ function getPrompt(session: ChatSession | null): string {
   if (!session) return "💬 新会话 > ";
   const title = session.title || "新会话";
   const thinkIcon = session.thinkEnabled ? " 🧠" : "";
-  const searchIcon = session["state"].searchEnabled ? " 🔍" : "";
+  const searchIcon = session.searchEnabled ? " 🔍" : "";
   return `💬 ${title}${thinkIcon}${searchIcon} > `;
 }
 
@@ -1972,21 +2255,21 @@ async function startRepl(): Promise<void> {
       try {
         if (!session) { session = ChatSession.create(client, store, promptBuilder, executor); }
         const newId = await client.createChatSession();
-        session["state"].id = newId;
+        session.setId(newId);
         store.setCurrentId(newId);
         // 构建包含历史 + 当前消息的首轮 prompt
         const historyParts: string[] = [];
         const env = scanDeepseekDir(ctx.workDir);
         session.setSystemPrompt(env.systemPrompt);
-        for (const m of session["state"].messages) {
+        for (const m of session.messages) {
           historyParts.push(`${m.role === "user" ? "User" : "Assistant"}: ${m.content}`);
         }
         historyParts.push(`User: ${msg}`);
         const fullPrompt = historyParts.join("\n\n");
-        session["state"].parentMessageId = null;
+        session.setParentMessageId(null);
         // 发送
         const stream = await client.chat(newId, null, fullPrompt,
-          session.thinkEnabled, session["state"].searchEnabled);
+          session.thinkEnabled, session.searchEnabled);
         const parser = new StreamParser();
         let assistantText = "";
         process.stdout.write("\n");
@@ -1995,13 +2278,13 @@ async function startRepl(): Promise<void> {
             assistantText += event.content;
             displayEvent(event, ctx.rawMode);
           } else if (event.type === "message_id") {
-            session["state"].parentMessageId = event.id;
+            session.setParentMessageId(event.id);
           } else if (event.type === "title") {
-            session["state"].title = event.title;
+            session.setTitle(event.title);
           }
         }
         session.pushUserAndAssistantMessages(msg, assistantText);
-        session["state"].updatedAt = Date.now();
+        session.touch();
         session.save();
       } catch (err: any) {
         console.error(`\n❌ 重建房间失败: ${err.message}`);
@@ -2119,37 +2402,33 @@ async function startRepl(): Promise<void> {
       } else {
         const prevSession = session;
         const result = await handleCommand(trimmed, session, ctx);
-        if (result === ("QUIT_REQUESTED" as any)) {
-          confirmQuit = true;
-          rl.setPrompt("确认退出？(y/n) > ");
-          session = prevSession;
-        } else if (typeof result === "string" && result.startsWith("PARENT_CONFIRM:")) {
-          pendingAction = "PARENT:" + result.slice(16);
-          rl.setPrompt("确认？(y/n) > ");
-          session = prevSession;
-        } else if (typeof result === "string" && result.startsWith("DEL_CONFIRM:")) {
-          pendingAction = "DEL_SINGLE:" + result.slice(12);
-          rl.setPrompt("确认删除？(y/n) > ");
-          session = prevSession;
-        } else if (typeof result === "string" && result.startsWith("REINJECT_CONFIRM:")) {
-          pendingAction = "REINJECT:" + result.slice(18);
-          rl.setPrompt("确认覆盖？(y/n) > ");
-          session = prevSession;
-        } else if (result === ("LOAD_INTERACTIVE" as any)) {
-          loadSubMode = true;
-          session = prevSession;
-        } else if (typeof result === "string" && result.startsWith("CD_SWITCHED:")) {
-          const newDir = result.slice(12);
-          const sw = switchWorkspace(newDir, session, ctx);
-          session = sw.session;
-        } else if (!result) {
-          // /quit confirmed → already saved and exited via confirmQuit
-          session = result;
+        if (result && typeof result === "object" && "type" in result) {
+          if (result.type === "quit") {
+            confirmQuit = true;
+            rl.setPrompt("确认退出？(y/n) > ");
+            session = prevSession;
+          } else if (result.type === "confirm" && result.action === "PARENT") {
+            pendingAction = "PARENT:" + result.newId;
+            rl.setPrompt("确认？(y/n) > ");
+            session = prevSession;
+          } else if (result.type === "confirm" && result.action === "DEL_SINGLE") {
+            pendingAction = "DEL_SINGLE:" + result.id;
+            rl.setPrompt("确认删除？(y/n) > ");
+            session = prevSession;
+          } else if (result.type === "confirm" && result.action === "REINJECT") {
+            pendingAction = "REINJECT:" + result.mode;
+            rl.setPrompt("确认覆盖？(y/n) > ");
+            session = prevSession;
+          } else if (result.type === "load_interactive") {
+            loadSubMode = true;
+            session = prevSession;
+          } else if (result.type === "cd_switched") {
+            const sw = switchWorkspace(result.dir, session, ctx);
+            session = sw.session;
+          }
         } else {
-          session = result;
-          // /new 或 /load 切换了会话 → 注入工具 prompt
-          if (session !== prevSession && session) {
-  // 不自动注入工具提示词，避免干扰内置搜索
+          session = result as ChatSession | null;
+          if (session && session !== prevSession) {
             // 不自动注入工具提示词，避免干扰内置搜索
           }
         }
@@ -2188,7 +2467,6 @@ async function startRepl(): Promise<void> {
     } else {
       session = ChatSession.create(client, store, promptBuilder, executor);
       session.setSystemPrompt(env.systemPrompt);
-  // 不自动注入工具提示词，避免干扰内置搜索
       // 不自动注入工具提示词，避免干扰内置搜索
       messageQueue.push(trimmed);
       await processQueue();
@@ -2209,4 +2487,18 @@ async function main(): Promise<void> {
   await startRepl();
 }
 
-main();
+if (process.argv[1] && (process.argv[1].endsWith("chat.ts") || process.argv[1].endsWith("chat"))) {
+  main();
+}
+
+// ============ 测试导出 ============
+export {
+  hlHash, lineHash, anchorHash, fileRev, getHashLength,
+  annotateReadOutput, formatAnnotatedLine, formatRef, formatRev,
+  parseLineRef, findRefCandidates, resolveLineRef,
+  splitToLines, resolveChanges, validateNoOverlap, applyChanges,
+  applyHashlineEdit, stripHashlineAnnotations,
+  HL_PREFIX, fileRevCache,
+  type HlOperation, type ResolvedChange,
+  SessionStore, scanDeepseekDir,
+}

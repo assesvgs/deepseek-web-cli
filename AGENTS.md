@@ -1,67 +1,95 @@
-# DeepSeek Web Plugin
+# AGENTS.md — deepseek-web-cli
 
-本仓库根目录是 DeepSeek 网页版 OpenCode 插件的开发工作区。`1/` 目录是 OpenClaw 完整源码（参考用），`openclaw-zero-token/` 是上游参考实现。
+## 项目定位
 
-## 插件结构
+基于 DeepSeek 网页版私有 API 的交互式命令行聊天 REPL。无需 API Key，零 Token 消耗。
 
-插件代码在 `deepseek-web/`，实际使用时安装在 `.opencode/plugin/deepseek-web/`。
+## 架构概要
 
-```
-deepseek-web/
-├── index.ts           # 插件入口，注册 Provider 和 session 钩子
-├── server.ts          # 本地代理 (8899 端口) — OpenAI 兼容接口 + SSE 格式转换
-├── client.ts          # DeepSeek 网页 API 客户端 (PoW + 聊天)
-├── auth.ts            # CDP 登录 / 凭证捕获
-├── login.ts           # 独立登录脚本
-├── chat.ts            # 独立命令行聊天 (不依赖 OpenCode)
-├── constants.ts       # 凭证读写
-├── types.ts           # 类型定义
-├── wasm-embedded.ts   # PoW WASM 模块 (base64)
-└── credentials.json   # 登录凭证 (gitignore)
-```
+- **核心文件**：`deepseek-web/chat.ts`（~2200 行单文件），所有功能内聚于此，可脱离其他文件独立运行
+- **入口**：`./deepseek-web/chat.ts`，shebang `#!/usr/bin/env -S npx tsx`
+- **只有 `deepseek-web/` 目录的代码是活跃的**，根目录的 `deepseek-web.ts` 只是 barrel 重导出（`export { default } from "./deepseek-web/index"`）
+- `openclaw-zero-token/` 是参考项目，已加入 `.gitignore`，不参与本项目代码
 
-## 前置条件
-
-- Node.js >= 18
-- Chrome 浏览器（需要以 `--remote-debugging-port=9222` 启动）
-- Android Termux 额外需要 `android-tools` + `adb forward tcp:9222 localabstract:chrome_devtools_remote`
-
-## 常用命令
+## 运行方式
 
 ```bash
-# 安装依赖
-cd deepseek-web && npm install
+cd deepseek-web
 
-# 登录获取凭证（需先启动 Chrome 远程调试）
-npx tsx login.ts
+# 前置依赖
+npm install -g tsx
+npm install         # 安装 playwright-core（仅登录时需要）
+npx tsx login.ts    # 获取凭证（需 Chrome 监听 9222 端口）
 
-# 独立命令行聊天
-npx tsx chat.ts "你好"
-npx tsx chat.ts --think "用思考模式"
-npx tsx chat.ts --session <room-id> "继续对话"
-npx tsx chat.ts --raw "查看原始 SSE 流"
-
-# 运行插件服务器（由 OpenCode 自动调用，一般无需手动启动）
-npx tsx server.ts
+# 启动 REPL
+./chat.ts
 ```
 
-## 架构要点
+**登录前置条件**：
+- 桌面端：Chrome 以 `--remote-debugging-port=9222` 启动
+- Android Termux：`pkg install android-tools` + `adb forward tcp:9222 localabstract:chrome_devtools_remote`
+- `playwright-core` 仅登录时使用，登录后 Chrome 可关闭
 
-- **会话绑定**：每个 OpenCode session 对应一个 DeepSeek 房间 (chat_session_id)，通过 parent_message_id 续写
-- **格式转换**：DeepSeek 私有 SSE 流 → OpenAI 兼容流（`server.ts` 实现）
-- **PoW 反爬**：通过嵌入的 WASM 模块计算 DeepSeekHashV1
-- **凭证生命周期**：凭证可能过期，需重新运行 `login.ts`
+**凭证**：`deepseek-web/credentials.json`（`cookie` + `bearer` + `userAgent`，已 gitignore）
 
-## 编码约定
+## 文件状态
 
-- TypeScript，ESM (`"type": "module"`)
+| 文件 | 状态 |
+|------|------|
+| `deepseek-web/chat.ts` | **活跃**，核心 REPL |
+| `deepseek-web/login.ts` | **活跃**，独立登录脚本 |
+| `deepseek-web/auth.ts` | **活跃**，CDP 登录逻辑（被 login.ts 和 chat.ts 内联引用） |
+| `deepseek-web/constants.ts` | 凭证读写工具函数 |
+| `deepseek-web/types.ts` | Credentials 类型定义 |
+| `deepseek-web/wasm-embedded.ts` | PoW WASM base64 常量（chat.ts 已内联，此文件保留作参考） |
+| `deepseek-web/server.ts` | **已暂停**，OpenCode 代理服务器 |
+| `deepseek-web/client.ts` | **已暂停**，旧版 API 客户端 |
+| `deepseek-web/index.ts` | **已暂停**，OpenCode 插件入口 |
+
+**只有 chat.ts 和 login.ts 是活跃开发文件，其余插件相关文件不要修改。**
+
+## 无构建/测试/检查流程
+
+- 无 `npm run build/test/lint/typecheck`
+- 直接用 `tsx` 执行 TypeScript，无编译步骤
+- 修改后直接 `./chat.ts` 运行验证
+
+## 平台适配
+
+- `chat.ts` 中 `IS_ANDROID = process.platform === "android"`，Android 下自动切换 URL 为 `http://127.0.0.1:9222`
+- `login.ts` 会将 `process.platform` 伪装为 `"linux"` 以加载 playwright-core（Android 原生不支持）
+- `auth.ts` 中 `openInChrome()` 仅在 Android 下通过 `am start` 自动打开 Chrome
+
+## 核心概念
+
+### 提示词三层体系
+工作目录下的 `.deepseek/` 目录（已 gitignore）：
+```
+.deepeesk/
+├── system.md          # 局部提示词（优先级最高）
+├── system-all.md      # 全局提示词（局部不存在时生效）
+├── tool.md            # 工具补充提示词
+└── sessions/          # 会话持久化目录
+    ├── _current       # 当前活跃会话 ID
+    └── <id>.json      # 会话存档
+```
+
+### 工作目录感知
+- 启动时 `process.cwd()` 为工作目录
+- `/cd <path>` 或 `!cd <path>` 切换目录后自动重新发现 `.deepseek/` 并恢复对应会话
+- 不同目录可有独立的提示词和会话
+
+### 惰性会话创建
+- `/new` 创建会话时 `id` 为空字符串占位
+- 首次 `send()` 发送消息时才调用 `client.createChatSession()` 获取真实 ID
+
+### PoW 反爬
+- 内嵌 WASM base64 常量 `SHA3_WASM_B64`
+- `PowSolver` 类根据 `algorithm` 字段自动派发：`sha256` 纯 JS，`DeepSeekHashV1` 用 WASM
+
+## 代码风格
+
 - 2 空格缩进
-- 中文注释（因为 README 和代码注释都是中文）
-- `deepseek-web/` 内不使用相对路径引用 `1/` 或 `openclaw-zero-token/` 的代码
-
-## 注意事项
-
-- `credentials.json` 包含敏感信息，已 gitignore
-- 网页版 API 非公开接口，可能随时变更或封锁
-- `deepseek-web/` 插件没有 `package.json`，作为 OpenCode 插件依赖由宿主管理
-- `plan*.md` 是重构计划文档，描述 chat.ts 的 REPL 化、工具调用等目标
+- 单文件内按段落组织：导入 → 类型 → 常量 → 工具函数 → 领域层 → 应用层 → 交互层 → main
+- 命令行交互用 `node:readline`，不引入第三方 REPL 库
+- 工具确认阻塞：`rl.pause()` → raw stdin 读一行 → 确认 → `rl.resume()`
