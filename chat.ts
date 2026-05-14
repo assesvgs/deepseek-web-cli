@@ -20,7 +20,9 @@ interface MessageRecord {
   role: "user" | "assistant";
   content: string;
   timestamp: number;
+  /** 云端分配的消息 ID（由 message_id 事件更新），用于 fork 时精确定位 */
   messageId?: number;
+  /** 续接点：当前消息基于哪条父消息，null 表示首轮 */
   parentMessageId: number | null;
 }
 
@@ -32,6 +34,8 @@ interface SessionState {
   forkedFrom?: string;
   thinkEnabled: boolean;
   searchEnabled: boolean;
+  modelType: string;
+  pendingFileIds: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -74,6 +78,16 @@ const JUNK_TOKENS = [
   "FINISHED",
 ];
 
+// Thinking 提示词注入（开启思考模式时追加到用户消息末尾）
+const THINKING_INJECTION_PROMPT =
+  "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n" +
+  "You MUST be very thorough in your thinking and comprehensively decompose " +
+  "the problem to resolve the root cause, rigorously stress-testing your logic " +
+  "against all potential paths, edge cases, and adversarial scenarios.\n" +
+  "Explicitly write out your entire deliberation process, documenting every " +
+  "intermediate step, considered alternative, and rejected hypothesis to ensure " +
+  "absolutely no assumption is left unchecked.";
+
 // ============ 第4部分：工具函数 ============
 
 function formatTime(ms: number): string {
@@ -85,6 +99,14 @@ function formatTime(ms: number): string {
   if (hours < 24) return `${hours} 小时前`;
   const d = new Date(ms);
   return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function replaceCitationMarkers(text: string, links: Map<number, string>): string {
+  return text.replace(/\[citation:\s*(\d+)\]/gi, (_match, numStr) => {
+    const idx = parseInt(numStr, 10);
+    const url = links.get(idx);
+    return url ? `[${idx}](${url})` : _match;
+  });
 }
 
 function extractChallenge(obj: any): any {
@@ -488,6 +510,8 @@ class DeepSeekClient {
     message: string,
     thinkingEnabled: boolean,
     searchEnabled: boolean,
+    modelType: string,
+    refFileIds: string[] = [],
     signal?: AbortSignal
   ): Promise<ReadableStream<Uint8Array>> {
     const targetPath = "/api/v0/chat/completion";
@@ -501,9 +525,10 @@ class DeepSeekClient {
       chat_session_id: sessionId,
       parent_message_id: parentMessageId ?? null,
       prompt: message,
-      ref_file_ids: [],
+      ref_file_ids: refFileIds,
       thinking_enabled: thinkingEnabled,
       search_enabled: searchEnabled,
+      model_type: modelType,
       preempt: false,
     });
 
@@ -523,6 +548,59 @@ class DeepSeekClient {
     }
     return res.body!;
   }
+
+  async uploadFile(
+    filePath: string,
+    modelType: string
+  ): Promise<{ fileId: string; filename: string }> {
+    const data = fs.readFileSync(filePath);
+    const filename = path.basename(filePath);
+
+    const targetPath = "/api/v0/file/upload_file";
+    const challenge = await this.createPowChallenge(targetPath);
+    const answer = await this.powSolver.solve(challenge);
+    const powResponse = Buffer.from(
+      JSON.stringify({ ...challenge, answer, target_path: targetPath })
+    ).toString("base64");
+
+    const boundary = "----Ds2apiUpload" + crypto.randomBytes(16).toString("hex");
+    const header = `------${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+    const footer = `\r\n------${boundary}--\r\n`;
+    const body = Buffer.concat([
+      Buffer.from(header, "utf-8"),
+      data,
+      Buffer.from(footer, "utf-8"),
+    ]);
+
+    const res = await fetch("https://chat.deepseek.com/api/v0/file/upload_file", {
+      method: "POST",
+      headers: {
+        ...(await this.headers()),
+        "Content-Type": `multipart/form-data; boundary=----${boundary}`,
+        "x-ds-pow-response": powResponse,
+        "x-file-size": String(data.length),
+        "x-thinking-enabled": "1",
+        "x-model-type": modelType,
+      },
+      body,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`文件上传失败 (${res.status}): ${text.slice(0, 200)}`);
+    }
+
+    const json: any = await res.json();
+    const fileId =
+      json?.data?.biz_data?.id ||
+      json?.data?.biz_data?.file_id ||
+      json?.data?.id ||
+      json?.data?.file_id ||
+      "";
+    if (!fileId) throw new Error("上传响应中未找到 file_id");
+
+    return { fileId, filename };
+  }
 }
 
 // ============ 第7部分：StreamParser ============
@@ -535,6 +613,8 @@ class StreamParser {
   private currentToolArgs = "";
   private currentEventType = "";
   private events: ParseEvent[] = [];
+  private citationLinks: Map<number, string> = new Map();
+  private currentFragmentType: string | null = null;
 
   private emitText(content: string) {
     if (content) this.events.push({ type: "text_delta", content });
@@ -580,10 +660,12 @@ class StreamParser {
           if (!trimmed) continue;
           this.feedLine(trimmed);
         }
+        yield* this.flushEvents();
       }
       // 处理最后一行
       if (lineBuffer.trim()) {
         this.feedLine(lineBuffer.trim());
+        yield* this.flushEvents();
       }
     } catch (err: any) {
       if (err.name === "AbortError") {
@@ -620,6 +702,9 @@ class StreamParser {
   }
 
   private processData(data: any) {
+    // 收集 citation links
+    this.collectCitations(data);
+
     // 捕获 message_id
     if (data.response_message_id !== undefined) {
       this.events.push({ type: "message_id", id: data.response_message_id });
@@ -648,8 +733,20 @@ class StreamParser {
       // 处理 fragments 数组（首段回复）
       const frags = data.v.response.fragments;
       for (const frag of frags) {
+        this.currentFragmentType = frag.type;
         if (frag.content) {
-          const isThinking = frag.type === "THINKING" || data.p?.includes("reasoning");
+          const isThinking = frag.type === "THINK" || data.p?.includes("reasoning");
+          this.pushDelta(frag.content, isThinking ? "thinking" : undefined);
+        }
+      }
+      return;
+    }
+    // 新 fragment 追加（如 response/fragments APPEND）
+    if (data.p === "response/fragments" && Array.isArray(data.v)) {
+      for (const frag of data.v) {
+        this.currentFragmentType = frag.type;
+        if (frag.content) {
+          const isThinking = frag.type === "THINK";
           this.pushDelta(frag.content, isThinking ? "thinking" : undefined);
         }
       }
@@ -674,8 +771,8 @@ class StreamParser {
     }
     if (content === "FINISHED") return;
 
-    // 检查是否是 thinking 类型的 data
-    if (data.p?.includes("reasoning") || data.type === "thinking") {
+    // 检查是否是 thinking 类型的内容
+    if (data.p?.includes("reasoning") || data.type === "thinking" || this.currentFragmentType === "THINK") {
       this.pushDelta(content, "thinking");
     } else {
       this.pushDelta(content);
@@ -699,15 +796,41 @@ class StreamParser {
     this.checkTags();
   }
 
+  private collectCitations(obj: any, seen?: WeakSet<object>): void {
+    if (!obj || typeof obj !== "object") return;
+    const visited = seen ?? new WeakSet<object>();
+    if (visited.has(obj as object)) return;
+    visited.add(obj as object);
+    if (obj.url && typeof obj.url === "string" && obj.url.startsWith("http")) {
+      const idx = obj.cite_index ?? obj.index;
+      if (typeof idx === "number") this.citationLinks.set(idx, obj.url);
+    }
+    for (const v of Object.values(obj)) {
+      if (v && typeof v === "object") this.collectCitations(v, visited);
+    }
+  }
+
+  getCitationLinks(): Map<number, string> { return this.citationLinks; }
+
   private checkTags() {
+    while (this.tagBuffer) {
+
     const thinkStartMatch = this.tagBuffer.match(/<(?:think(?:ing)?|thought)\b[^<>]*>/i);
     const thinkEndMatch = this.tagBuffer.match(/<\/(?:think(?:ing)?|thought)\b[^<>]*>/i);
     const toolCallStartMatch =
+      // DSML 格式: <|DSML|invoke name="xxx">
+      this.tagBuffer.match(/<\|DSML\|invoke\s+name=['"]?([^'">]+)['"]?[^>]*>/i) ||
+      // 普通格式
       this.tagBuffer.match(
         /<tool_call\s+(?:id=['"]?([^'"]+)['"]?\s+)?name=['"]?([^'"]+)['"]?(?:\s+id=['"]?([^'"]+)['"]?)?\s*>/i,
       ) ||
       this.tagBuffer.match(/<tool_call\s+id=['"]?([^'"]+)['"]?\s*>/i);
-    const toolCallEndMatch = this.tagBuffer.match(/<\/tool_call\b[^<>]*>/i);
+    const dsmlContainerStart = this.tagBuffer.match(/<\|DSML\|tool_?calls\b[^<>]*>/i);
+    const toolCallEndMatch =
+      this.tagBuffer.match(/<\/\|DSML\|invoke\b[^<>]*>/i) ||
+      this.tagBuffer.match(/<\/\|DSML\|tool_?calls\b[^<>]*>/i) ||
+      this.tagBuffer.match(/<\|DSML\|invoke\s*\/>/i) ||
+      this.tagBuffer.match(/<\/tool_call\b[^<>]*>/i);
     const finalStartMatch = this.tagBuffer.match(/<final\b[^<>]*>/i);
     const finalEndMatch = this.tagBuffer.match(/<\/final\b[^<>]*>/i);
     const replyMatch = this.tagBuffer.match(/\[\[reply_to_current\]\]/i);
@@ -732,13 +855,25 @@ class StreamParser {
         name: toolCallStartMatch ? toolCallStartMatch[2] || toolCallStartMatch[1] || "" : "",
       },
       { type: "tool_call_end", idx: toolCallEndMatch ? toolCallEndMatch.index! : -1, len: toolCallEndMatch ? toolCallEndMatch[0].length : 0 },
+      { type: "dsml_container", idx: dsmlContainerStart ? dsmlContainerStart.index! : -1, len: dsmlContainerStart ? dsmlContainerStart[0].length : 0 },
       { type: "reply_marker", idx: replyMatch ? replyMatch.index! : -1, len: replyMatch ? replyMatch[0].length : 0 },
       { type: "think_start", idx: malformedThinkMatch ? malformedThinkMatch.index! : -1, len: malformedThinkMatch ? malformedThinkMatch[0].length : 0 },
     ]
       .filter((tag) => tag.idx !== -1)
       .sort((a, b) => a.idx - b.idx);
 
-    if (indices.length === 0) return;
+    if (indices.length === 0) {
+      // 无标签边界：当前模式的纯文本立即输出，避免积压
+      if (this.tagBuffer && this.currentMode !== "tool_call") {
+        if (this.currentMode === "thinking") {
+          this.emitThinking(this.tagBuffer);
+        } else {
+          this.emitText(this.tagBuffer);
+        }
+        this.tagBuffer = "";
+      }
+      return;
+    }
 
     const first = indices[0];
     const before = this.tagBuffer.slice(0, first.idx);
@@ -747,7 +882,10 @@ class StreamParser {
       if (this.currentMode === "thinking") {
         this.emitThinking(before);
       } else if (this.currentMode === "tool_call") {
-        this.currentToolArgs += before;
+        // CDATA 包裹提取
+        const cdataMatch = before.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+        const argsText = cdataMatch ? cdataMatch[1] : before;
+        this.currentToolArgs += argsText;
         this.emitToolCallDelta(before);
       } else {
         this.emitText(before);
@@ -784,16 +922,15 @@ class StreamParser {
       });
       this.currentMode = "text";
       this.currentToolArgs = "";
-    } else if (first.type === "final_start" || first.type === "final_end" || first.type === "reply_marker") {
-      this.currentMode = "text";
+    } else if (first.type === "final_start" || first.type === "final_end" || first.type === "reply_marker" || first.type === "dsml_container") {
+      // final_start、reply_marker 和 DSML 容器标签：回到 text 模式或被简单消费
+      if (first.type !== "dsml_container") this.currentMode = "text";
     }
 
     // 切掉已处理部分
     this.tagBuffer = this.tagBuffer.slice(first.idx + first.len);
 
-    // 递归检查剩余 buffer 中的标签
-    if (this.tagBuffer) {
-      this.checkTags();
+    // 循环继续处理剩余 buffer（替代原递归）
     }
   }
 
@@ -802,7 +939,9 @@ class StreamParser {
       if (this.currentMode === "thinking") {
         this.emitThinking(this.tagBuffer);
       } else if (this.currentMode === "tool_call") {
-        this.currentToolArgs += this.tagBuffer;
+        const cdataMatch = this.tagBuffer.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+        const argsText = cdataMatch ? cdataMatch[1] : this.tagBuffer;
+        this.currentToolArgs += argsText;
         this.emitToolCallDelta(this.tagBuffer);
         // 未闭合的 tool_call，自动闭合
         let args: Record<string, unknown> = {};
@@ -945,7 +1084,14 @@ class ToolRegistry {
 class ToolExecutor {
   constructor(private registry: ToolRegistry) {}
 
-  private async askConfirm(question: string): Promise<boolean> {
+  private async askConfirm(question: string, rl?: readline.Interface): Promise<boolean> {
+    if (rl) {
+      const answer = await new Promise<string>((resolve) => {
+        rl.question(question, (ans) => resolve(ans.trim().toLowerCase()));
+      });
+      return answer === "y" || answer === "yes";
+    }
+    // 回退：直接读 stdin（非 REPL 场景）
     process.stdout.write(question);
     const answer = await new Promise<string>((resolve) => {
       process.stdin.once("data", (buf: Buffer) => {
@@ -961,13 +1107,9 @@ class ToolExecutor {
 
     // 写操作需要确认
     if (name === "write" || name === "exec" || name === "edit") {
-      if (rl) rl.pause();
-      try {
-        const confirmed = await this.askConfirm(`⚠️ 确认执行 ${name}？(y/n) `);
-        if (!confirmed) return "用户取消了操作";
-      } finally {
-        if (rl) rl.resume();
-      }
+      const detail = name === "exec" ? `: ${args.command}` : "";
+      const confirmed = await this.askConfirm(`⚠️ 确认执行 ${name}${detail}？(y/n) `, rl);
+      if (!confirmed) return "用户取消了操作";
     }
 
     return this.runTool(name, args);
@@ -1052,6 +1194,7 @@ class PromptBuilder {
     toolsPrompt: string,
     userMessage: string,
     isFirstTurn: boolean,
+    thinkInjectionPrompt: string,
     toolMdContent?: string,
     skillMdContent?: string
   ): string {
@@ -1060,6 +1203,7 @@ class PromptBuilder {
     }
     const parts: string[] = [];
     if (systemPrompt) parts.push(systemPrompt);
+    if (thinkInjectionPrompt) parts.push(thinkInjectionPrompt);
     if (toolsPrompt) parts.push(toolsPrompt);
     if (toolMdContent) parts.push(toolMdContent);
     if (skillMdContent) parts.push(skillMdContent);
@@ -1073,9 +1217,12 @@ class PromptBuilder {
 class ChatSession {
   private state: SessionState;
   private reinjectMode: "new" | "keep" | null = null;
-  private _ac: AbortController | null = null;
+  private ac: AbortController | null = null;
   private systemPromptCache = "";
   private toolsPrompt = "";
+  private thinkInjectionPrompt = THINKING_INJECTION_PROMPT;
+  private toolMdContent = "";
+  private skillMdContent = "";
   private rl: readline.Interface | null = null;
 
   constructor(
@@ -1092,9 +1239,11 @@ class ChatSession {
   get title(): string { return this.state.title; }
   get thinkEnabled(): boolean { return this.state.thinkEnabled; }
   get searchEnabled(): boolean { return this.state.searchEnabled; }
+  get modelType(): string { return this.state.modelType; }
   get parentMessageId(): number | null { return this.state.parentMessageId; }
   get messageCount(): number { return this.state.messages.length; }
   get reinjectMode(): "new" | "keep" | null { return this.reinjectMode; }
+  get isToolEnabled(): boolean { return this.toolsPrompt !== ""; }
   get messages(): MessageRecord[] { return this.state.messages; }
   set messages(v: MessageRecord[]) { this.state.messages = v; }
   get forkedFrom(): string | undefined { return this.state.forkedFrom; }
@@ -1104,9 +1253,15 @@ class ChatSession {
 
   setThinkEnabled(v: boolean): void { this.state.thinkEnabled = v; }
   setSearchEnabled(v: boolean): void { this.state.searchEnabled = v; }
+  setModelType(v: string): void { this.state.modelType = v; }
+  addPendingFileId(id: string): void { this.state.pendingFileIds.push(id); }
+  clearPendingFileIds(): void { this.state.pendingFileIds = []; }
   setParentMessageId(id: number | null): void { this.state.parentMessageId = id; }
   setReinjectMode(m: "new" | "keep" | null): void { this.reinjectMode = m; }
   setSystemPrompt(p: string): void { this.systemPromptCache = p; }
+  setThinkInjectionPrompt(p: string): void { this.thinkInjectionPrompt = p; }
+  setToolMdContent(c: string): void { this.toolMdContent = c; }
+  setSkillMdContent(c: string): void { this.skillMdContent = c; }
   setToolsPrompt(p: string): void { this.toolsPrompt = p; }
   setRl(rl: readline.Interface | null): void { this.rl = rl; }
   setClient(creds: Credentials): void { this.client = new DeepSeekClient(creds); }
@@ -1119,14 +1274,14 @@ class ChatSession {
   }
 
   abort(): void {
-    if (this._ac) {
-      this._ac.abort();
-      this._ac = null;
+    if (this.ac) {
+      this.ac.abort();
+      this.ac = null;
     }
   }
 
   async *send(userMessage: string, rawMode: boolean): AsyncGenerator<ParseEvent> {
-    this._ac = new AbortController();
+    this.ac = new AbortController();
 
     // 处理 reinject
     let isFirstTurn = this.state.parentMessageId === null;
@@ -1141,7 +1296,10 @@ class ChatSession {
 
     // 构建 prompt
     const prompt = this.promptBuilder.build(
-      this.systemPromptCache, this.toolsPrompt, userMessage, isFirstTurn
+      this.systemPromptCache, this.toolsPrompt, userMessage, isFirstTurn,
+      this.state.thinkEnabled ? this.thinkInjectionPrompt : "",
+      this.isToolEnabled ? this.toolMdContent : "",
+      this.skillMdContent
     );
 
     // 惰性创建 sessionId
@@ -1152,6 +1310,7 @@ class ChatSession {
         this.store.setCurrentId(realId);
       } catch (err: any) {
         yield { type: "error", message: `创建会话失败: ${err.message}` };
+        this.ac = null;
         return;
       }
     }
@@ -1159,18 +1318,23 @@ class ChatSession {
     // 工具调用循环（最大 10 次）
     let currentPrompt = prompt;
     let currentParentId = this.state.parentMessageId;
+    const parentIdSnapshot = this.state.parentMessageId;
     let depth = 0;
     const MAX_TOOL_CALLS = 10;
     let assistantText = "";
     let foundToolCall = false;
+    let lastParser: StreamParser | null = null;
 
     while (depth <= MAX_TOOL_CALLS) {
       foundToolCall = false;
       let stream: ReadableStream<Uint8Array>;
       try {
+        const refIds = [...this.state.pendingFileIds];
+        this.state.pendingFileIds = [];
         stream = await this.client.chat(
           this.state.id, currentParentId, currentPrompt,
-          this.state.thinkEnabled, this.state.searchEnabled, this._ac.signal
+          this.state.thinkEnabled, this.state.searchEnabled, this.state.modelType,
+          refIds, this.ac.signal
         );
       } catch (err: any) {
         if (err.name === "AbortError") {
@@ -1180,6 +1344,7 @@ class ChatSession {
         } else {
           yield { type: "error", message: `网络错误: ${err.message}` };
         }
+        this.ac = null;
         return;
       }
 
@@ -1197,6 +1362,7 @@ class ChatSession {
             rawText += chunk;
           }
           if (rawText.trim()) {
+            // rawMode 不解析 SSE，this.state.parentMessageId 未被覆盖，等于 parentIdSnapshot
             this.state.messages.push(
               { role: "user", content: userMessage, timestamp: Date.now(), parentMessageId: this.state.parentMessageId },
               { role: "assistant", content: rawText, timestamp: Date.now(), parentMessageId: this.state.parentMessageId }
@@ -1210,11 +1376,12 @@ class ChatSession {
           reader.releaseLock();
         }
         yield { type: "end" };
-        this._ac = null;
+        this.ac = null;
         return;
       }
 
       const parser = new StreamParser();
+      lastParser = parser;
 
       for await (const event of parser.parse(stream)) {
         switch (event.type) {
@@ -1230,10 +1397,11 @@ class ChatSession {
             foundToolCall = true;
             yield event;
             try {
-              const result = await this.toolExecutor.execute(event.name, event.arguments);
+              const result = await this.toolExecutor.execute(event.name, event.arguments, this.rl);
               currentPrompt = `\n<tool_response id="" name="${event.name}">\n${result}\n</tool_response>\n\nPlease proceed based on this tool result.`;
             } catch (toolErr: any) {
               yield { type: "error", message: `工具执行失败: ${toolErr.message}` };
+              this.ac = null;
               return;
             }
             break;
@@ -1266,26 +1434,42 @@ class ChatSession {
     // 检测空回复（房间可能已被删除）
     if (!assistantText && !foundToolCall) {
       const historyRounds = Math.floor(this.state.messages.length / 2);
+      this.state.messages.push({ role: "user", content: userMessage, timestamp: Date.now(), parentMessageId: this.state.parentMessageId });
+      this.state.updatedAt = Date.now();
+      this.save();
       yield { type: "error", message: "会话无响应，房间可能已被删除" };
       yield { type: "room_recovery", historyRounds };
+      this.ac = null;
       return;
     }
 
-    this.pushUserAndAssistantMessages(userMessage, assistantText);
+    const citationLinks = lastParser?.getCitationLinks();
+    if (citationLinks && citationLinks.size > 0 && assistantText) {
+      assistantText = replaceCitationMarkers(assistantText, citationLinks);
+    }
+
+    this.pushUserAndAssistantMessages(userMessage, assistantText, parentIdSnapshot);
     this.state.updatedAt = Date.now();
     this.save();
-    this._ac = null;
+    this.ac = null;
   }
 
-  pushUserAndAssistantMessages(userText: string, assistantText: string): void {
+  /** 将单轮对话（user + assistant）推入消息历史。
+   *  assistant 的 messageId 取自运行时被 message_id 事件更新后的 parentMessageId（即云端分配的新 ID），
+   *  parentMessageId 取自传入的快照（pmId），二者在 room recovery 场景下可能不同。
+   */
+  pushUserAndAssistantMessages(userText: string, assistantText: string, parentMessageId: number | null): void {
+    const pmId = parentMessageId ?? this.state.parentMessageId;
     this.state.messages.push({
       role: "user", content: userText, timestamp: Date.now(),
-      parentMessageId: this.state.parentMessageId,
+      parentMessageId: pmId,
     });
     if (assistantText) {
       this.state.messages.push({
         role: "assistant", content: assistantText, timestamp: Date.now(),
-        parentMessageId: this.state.parentMessageId,
+        parentMessageId: pmId,
+        // 云端消息 ID：已被 message_id 事件更新为当前轮的新 ID
+        messageId: this.state.parentMessageId ?? undefined,
       });
     }
   }
@@ -1296,7 +1480,7 @@ class ChatSession {
   ): ChatSession {
     const state: SessionState = {
       id: "", title: title || "", parentMessageId: null,
-      messages: [], thinkEnabled: false, searchEnabled: true,
+      messages: [], thinkEnabled: false, searchEnabled: true, modelType: "default", pendingFileIds: [],
       createdAt: Date.now(), updatedAt: Date.now(),
     };
     return new ChatSession(state, client, store, promptBuilder, executor);
@@ -1319,20 +1503,22 @@ function scanDeepseekDir(workDir: string): {
   systemSource: "local" | "global" | "none";
   toolMdContent: string;
   skillMdContent: string;
+  thinkMdContent: string;
 } {
   const deepseekDir = path.join(workDir, ".deepseek");
   const localSystem = readFileIfExists(path.join(deepseekDir, "system.md"));
   const globalSystem = readFileIfExists(path.join(deepseekDir, "system-all.md"));
   const toolMd = readFileIfExists(path.join(deepseekDir, "tool.md"));
   const skillMd = readFileIfExists(path.join(deepseekDir, "skill.md"));
+  const thinkMd = readFileIfExists(path.join(deepseekDir, "think.md"));
 
   if (localSystem) {
-    return { systemPrompt: localSystem, systemSource: "local", toolMdContent: toolMd, skillMdContent: skillMd };
+    return { systemPrompt: localSystem, systemSource: "local", toolMdContent: toolMd, skillMdContent: skillMd, thinkMdContent: thinkMd };
   }
   if (globalSystem) {
-    return { systemPrompt: globalSystem, systemSource: "global", toolMdContent: toolMd, skillMdContent: skillMd };
+    return { systemPrompt: globalSystem, systemSource: "global", toolMdContent: toolMd, skillMdContent: skillMd, thinkMdContent: thinkMd };
   }
-  return { systemPrompt: "", systemSource: "none", toolMdContent: toolMd, skillMdContent: skillMd };
+  return { systemPrompt: "", systemSource: "none", toolMdContent: toolMd, skillMdContent: skillMd, thinkMdContent: thinkMd };
 }
 
 // ============ 第14部分：登录与凭证管理 ============
@@ -1353,9 +1539,15 @@ async function loginDeepseek(
   onProgress: (msg: string) => void
 ): Promise<Credentials> {
   // 平台伪装：支持在 Termux/Android 上运行 Playwright
+  const originalPlatform = process.platform;
   if (process.platform === "android") {
-    Object.defineProperty(process, "platform", { value: "linux" });
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
   }
+  const restorePlatform = () => {
+    if (process.platform !== originalPlatform) {
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    }
+  };
   const CDP_URL = "http://127.0.0.1:9222";
   let chromium: any;
   try {
@@ -1429,6 +1621,7 @@ async function loginDeepseek(
       if (bearer) {
         onProgress("发现有效登录态，无需重新登录！");
         await browser.close();
+        restorePlatform();
         return { cookie: cookieStr, bearer, userAgent };
       }
     }
@@ -1513,6 +1706,7 @@ async function loginDeepseek(
     return result;
   } finally {
     await browser.close();
+    restorePlatform();
   }
 }
 
@@ -1524,7 +1718,8 @@ function loadCredentials(): Credentials | null {
   try {
     if (!fs.existsSync(CRED_FILE)) return null;
     return JSON.parse(fs.readFileSync(CRED_FILE, "utf-8")) as Credentials;
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ 凭证文件读取异常:", String(err));
     return null;
   }
 }
@@ -1616,6 +1811,9 @@ async function handleCommand(
       ctx.store.setCurrentId(session.sessionId);
       const env = scanDeepseekDir(ctx.workDir);
       session.setSystemPrompt(env.systemPrompt);
+      if (env.thinkMdContent) session.setThinkInjectionPrompt(env.thinkMdContent);
+      if (env.toolMdContent) session.setToolMdContent(env.toolMdContent);
+      if (env.skillMdContent) session.setSkillMdContent(env.skillMdContent);
       // 不自动注入工具提示词，避免干扰内置搜索
 
       log(`✅ 已创建新会话${title ? ` ${title}` : ""}`);
@@ -1674,19 +1872,12 @@ async function handleCommand(
     }
 
     case "del": case "delete": {
-      if (args[0] === "--all") {
-        // 进入删除子模式
-        return session; // 实际由 REPL 层处理
-      }
       const id = args[0];
-      if (id) {
-        const target = ctx.store.load(id);
-        if (!target) { log(`❌ 未找到会话 ${id}`); return session; }
-        log(`⚠️ 确认删除会话 ${id} - ${target.title}？(y/n)`);
-        return { type: "confirm", action: "DEL_SINGLE", id } as CommandResult;
-      }
-      // 无参数：返回标志给 REPL 进入删除子模式
-      return session;
+      if (!id) { log("❌ 用法: /del <id>"); return session; }
+      const target = ctx.store.load(id);
+      if (!target) { log(`❌ 未找到会话 ${id}`); return session; }
+      log(`⚠️ 确认删除会话 ${id} - ${target.title}？(y/n)`);
+      return { type: "confirm", action: "DEL_SINGLE", id } as CommandResult;
     }
 
     case "p": case "parent": {
@@ -1706,22 +1897,22 @@ async function handleCommand(
       const forkId = args[0] ? parseInt(args[0], 10) : undefined;
       const title = args.slice(forkId !== undefined ? 1 : 0).join(" ") || undefined;
 
-      // 构建历史文本
+      // 构建 fork 范围
       const messages = session.messages;
-      const stopIdx = forkId !== undefined ? messages.findIndex((m: MessageRecord) => m.messageId === forkId) + 1 : messages.length;
-      const historyParts: string[] = [];
-      let i = 0;
-      while (i < stopIdx && i < messages.length) {
-        const m = messages[i];
-        historyParts.push(`${m.role === "user" ? "User" : "Assistant"}: ${m.content}`);
-        i++;
+      let stopIdx: number;
+      if (forkId !== undefined) {
+        const idx = messages.findIndex((m: MessageRecord) => m.messageId === forkId);
+        if (idx === -1) { log(`❌ 消息 ID ${forkId} 未在历史中找到`); return session; }
+        stopIdx = idx + 1;
+      } else {
+        stopIdx = messages.length;
       }
-      const historyText = historyParts.join("\n");
 
       try {
         const forkSession = ChatSession.create(ctx.client, ctx.store, ctx.promptBuilder, ctx.toolExecutor, title);
-        // 注入历史到新会话
+        // 注入历史到新会话，清除消息级 parentMessageId
         forkSession.messages = messages.slice(0, stopIdx);
+        for (const fm of forkSession.messages) fm.parentMessageId = null;
         forkSession.forkedFrom = session.sessionId;
         if (!title && session.title) forkSession.setTitle(`${session.title} - 分支`);
 
@@ -1732,6 +1923,9 @@ async function handleCommand(
         // 新会话首轮注入历史
         const env = scanDeepseekDir(ctx.workDir);
         forkSession.setSystemPrompt(env.systemPrompt);
+        if (env.thinkMdContent) forkSession.setThinkInjectionPrompt(env.thinkMdContent);
+        if (env.toolMdContent) forkSession.setToolMdContent(env.toolMdContent);
+        if (env.skillMdContent) forkSession.setSkillMdContent(env.skillMdContent);
         forkSession.save();
         ctx.store.setCurrentId(newId);
         session = forkSession;
@@ -1754,13 +1948,15 @@ async function handleCommand(
     }
 
     case "history": {
-      if (args[0] === "off") { log("🔇 自动打印：关"); return session; }
-      if (args[0] === "on") { log("🔊 自动打印：开"); return session; }
       const targetSession = args.includes("-id") ? ctx.store.load(args[args.indexOf("-id") + 1]) : null;
       const msgs = targetSession ? targetSession.messages : (session ? session.messages : []);
       const showAll = args.includes("-a");
       const rIdx = args.indexOf("-r");
-      const range = rIdx !== -1 ? parseInt(args[rIdx + 1], 10) || 2 : (parseInt(args[0], 10) || (showAll ? msgs.length : 2));
+      const parsedR = parseInt(args[rIdx + 1], 10);
+      const parsedFirst = parseInt(args[0], 10);
+      const range = rIdx !== -1
+        ? (isNaN(parsedR) ? 2 : parsedR)
+        : (isNaN(parsedFirst) ? (showAll ? msgs.length : 2) : parsedFirst);
       const rounds = Math.min(range, showAll ? msgs.length : range);
       const start = Math.max(0, msgs.length - rounds * 2);
       for (let i = start; i < msgs.length; i++) {
@@ -1778,7 +1974,11 @@ async function handleCommand(
         if (fs.existsSync(sysFile)) {
           fs.unlinkSync(sysFile);
           const newEnv = scanDeepseekDir(ctx.workDir);
-          if (session) session.setSystemPrompt(newEnv.systemPrompt);
+          if (session) {
+            session.setSystemPrompt(newEnv.systemPrompt);
+            session.setToolMdContent(newEnv.toolMdContent);
+            session.setSkillMdContent(newEnv.skillMdContent);
+          }
           if (newEnv.systemSource === "global") {
             log(`✅ 已清除局部提示词\n   当前回退到全局提示词: .deepseek/system-all.md`);
           } else {
@@ -1789,8 +1989,8 @@ async function handleCommand(
         }
       } else if (args[0] === "-f") {
         const srcPath = args[1];
-        if (!srcPath || !fs.existsSync(srcPath)) {
-          log(`❌ 源文件不存在: ${srcPath || ""}`);
+        if (!srcPath || !fs.existsSync(srcPath) || !fs.statSync(srcPath).isFile()) {
+          log(`❌ 源文件不存在或不是文件: ${srcPath || ""}`);
           return session;
         }
         const isLocal = args.includes("-l");
@@ -1829,26 +2029,40 @@ async function handleCommand(
       }
       session.setReinjectMode(mode);
       const env = scanDeepseekDir(ctx.workDir);
-      const promptLen = env.systemPrompt.length + ctx.toolRegistry.buildToolPrompt().length;
+      const promptLen = env.systemPrompt.length + env.toolMdContent.length + env.skillMdContent.length + ctx.toolRegistry.buildToolPrompt().length;
       log(`🔄 下次消息将重新注入提示词（共 ${promptLen} 字，模式：${mode === "new" ? "-new" : "-keep"}）`);
       return session;
     }
 
-    case "t": case "tools": {
+    case "t": case "tool": case "tools": {
       const tools = ctx.toolRegistry.list();
-      log("🔧 可用工具：\n");
-      tools.forEach((t) => {
-        const confirm = (t.name === "write" || t.name === "exec") ? "  [需确认]" : "";
-        log(`   ${t.name.padEnd(12)}${t.description}${confirm}`);
-      });
+      if (args[0] === "-l" || args[0] === "list" || args.length === 0) {
+        log("🔧 可用工具：\n");
+        tools.forEach((t) => {
+          const confirm = (t.name === "write" || t.name === "exec") ? "  [需确认]" : "";
+          log(`   ${t.name.padEnd(12)}${t.description}${confirm}`);
+        });
+        return session;
+      }
+      if (!session) { log("❌ 没有活跃会话"); return session; }
+      if (args[0] === "on") {
+        session.setToolsPrompt(ctx.toolRegistry.buildToolPrompt());
+        session.setReinjectMode("keep");
+        log("🔧 工具模式：开（下条消息将重新注入提示词）");
+      } else if (args[0] === "off") {
+        session.setToolsPrompt("");
+        log("🔧 工具模式：关");
+      } else {
+        log("❌ 用法: /tool on | off | -l");
+      }
       return session;
     }
 
     case "think": {
       if (!session) { log("❌ 没有活跃会话"); return session; }
-      if (args[0] === "on") { session.setThinkEnabled(true); log("🧠 思考模式：开"); }
-      else if (args[0] === "off") { session.setThinkEnabled(false); log("🧠 思考模式：关"); }
-      else { session.setThinkEnabled(!session.thinkEnabled); log(`🧠 思考模式：${session.thinkEnabled ? "开" : "关"}`); }
+      if (args[0] === "on") { session.setThinkEnabled(true); log("💭 思考模式：开"); }
+      else if (args[0] === "off") { session.setThinkEnabled(false); log("💭 思考模式：关"); }
+      else { session.setThinkEnabled(!session.thinkEnabled); log(`💭 思考模式：${session.thinkEnabled ? "开" : "关"}`); }
       return session;
     }
 
@@ -1857,6 +2071,38 @@ async function handleCommand(
       if (args[0] === "on") { session.setSearchEnabled(true); log("🔍 联网搜索：开"); }
       else if (args[0] === "off") { session.setSearchEnabled(false); log("🔍 联网搜索：关"); }
       else { session.setSearchEnabled(!session.searchEnabled); log(`🔍 联网搜索：${session.searchEnabled ? "开" : "关"}`); }
+      return session;
+    }
+
+    case "m": case "model": {
+      if (!session) { log("❌ 没有活跃会话"); return session; }
+      const validTypes = ["flash", "pro", "vision"];
+      const typeMap: Record<string, string> = { flash: "default", pro: "expert", vision: "vision" };
+      if (args[0] && validTypes.includes(args[0])) {
+        session.setModelType(typeMap[args[0]]);
+        log(`🔷 模型已切换：${args[0]}`);
+      } else {
+        const current = Object.entries(typeMap).find(([, v]) => v === session.modelType)?.[0] || "flash";
+        log(`🔷 当前模型：${current}，用法: /m [flash|pro|vision]`);
+      }
+      return session;
+    }
+
+    case "up": case "upload": {
+      if (!session) { log("❌ 没有活跃会话"); return session; }
+      const filePath = args[0];
+      if (!filePath) { log("❌ 用法: /up <文件路径>"); return session; }
+      const resolved = path.isAbsolute(filePath) ? filePath : path.join(ctx.workDir, filePath);
+      if (!fs.existsSync(resolved)) { log(`❌ 文件不存在: ${resolved}`); return session; }
+      try {
+        log(`⏳ 正在上传: ${path.basename(resolved)}...`);
+        const { fileId, filename } = await ctx.client.uploadFile(resolved, session.modelType);
+        session.addPendingFileId(fileId);
+        log(`✅ 已上传: ${filename} (file_id: ${fileId})`);
+        log(`   将在下一条消息中作为附件发送`);
+      } catch (err: any) {
+        log(`❌ 上传失败: ${err.message}`);
+      }
       return session;
     }
 
@@ -1870,7 +2116,8 @@ async function handleCommand(
       if (!session) { log("❌ 没有活跃会话"); return session; }
       if (args[0] === "on") {
         session.setToolsPrompt(ctx.toolRegistry.buildToolPrompt());
-        log("🔧 工具模式：开");
+        session.setReinjectMode("keep");
+        log("🔧 工具模式：开（下条消息将重新注入提示词）");
       } else if (args[0] === "off") {
         session.setToolsPrompt("");
         log("🔧 工具模式：关");
@@ -1912,39 +2159,44 @@ async function handleCommand(
 
     case "?": case "h": case "help": {
       log("📖 DeepSeek Web CLI 帮助\n");
-      log("会话管理:");
+      log("会话:");
       log("  /new  [标题]      创建新会话");
-      log("  /load [id]        切换会话（无参数时交互式选择，输 q 退出）");
-      log("  /list, /ls        列出所有会话（ID、标题、轮数、时间、fork 信息）");
-      log("  /del  [id|--all]  删除会话（无参数时交互式，输入序号/a/q）");
+      log("  /load [id]        切换会话（无参数时交互式选择）");
+      log("  /list, /ls        列出所有会话");
+      log("  /del  [id|--all]  删除会话（无参数时交互式）");
       log("  /parent <id>, /p  手动覆盖续接点（需确认）");
       log("  /fork [id] [标题], /f  分叉新会话");
-      log("  /save, /s         手动保存当前会话");
-      log("  /history          查看历史 [-r N 最近N轮] [-a 全部] [-id <id> 指定会话] [on/off 开关自动打印]");
-      log("\n提示词管理:");
-      log("  /system, /sys     查看当前提示词状态");
-      log("  /sys -c           清除局部提示词（回退到全局）");
-      log("  /sys -f <path>    从文件加载为全局提示词");
-      log("  /sys -f <path> -l 从文件加载为局部提示词");
-      log("  /reinject, /rj    重新注入提示词 [-new 重置父消息] [-keep 保持续接]");
+      log("  /save, /s         手动保存");
+      log("  /history          查看历史");
+      log("    -r N             最近 N 轮");
+      log("    -a               全部");
+      log("    -id <id>         指定会话");
+      log("\n提示词:");
+      log("  /system, /sys     查看提示词状态");
+      log("    -c               清除局部（回退到全局）");
+      log("    -f <path> [-l]   加载提示词（-l 为局部）");
+      log("  /reinject, /rj    重新注入提示词");
+      log("    -new             重置父消息");
+      log("    -keep            保持续接点");
       log("\n工具:");
-      log("  /tools, /t        列出可用工具（read/write/edit/exec）");
-      log("  /tool  on/off     切换工具模式（开启后 AI 可使用工具）");
+      log("  /tool, /t          列表（无参 / -l）/ 切换（on / off）");
       log("\n凭证:");
-      log("  /auth             查看凭证状态（脱敏显示）");
-      log("  /auth  -s         发送 API 请求验证凭证有效性");
-      log("  /reauth           重新登录获取凭证（覆盖式）");
-      log("\n模式切换:");
-      log("  /think [on/off]   切换思考模式（默认关，提示符显示 🧠）");
-      log("  /search [on/off]  切换联网搜索（默认开，提示符显示 🔍）");
-      log("  /raw              切换原始 SSE 数据流（调试用）");
+      log("  /auth              查看凭证状态");
+      log("    -s               发送请求验证凭证有效性");
+      log("  /reauth           重新登录");
+      log("\n模式:");
+      log("  /think [on|off]   切换思考模式（提示符 💭）");
+      log("  /search [on|off]  切换联网搜索（提示符 🔍）");
+      log("  /model, /m [flash|pro|vision]  切换模型");
+      log("  /upload, /up <路径>  上传文件");
+      log("  /raw              切换原始 SSE（调试用）");
       log("\n系统:");
-      log("  /?, /h            显示本帮助");
-      log("  /quit, /q         退出（需确认 y/n）");
+      log("  /?, /h            帮助");
+      log("  /quit, /q         退出");
       log("  /clear            清屏");
-      log("  /cd <path>        切换工作目录（自动发现提示词和会话）");
-      log("  /pwd              显示当前工作目录");
-      log("  !<cmd>            Shell 透传（如 !ls, !echo）");
+      log("  /cd <path>        切换工作目录");
+      log("  /pwd              显示当前目录");
+      log("  !<cmd>            Shell 透传");
       return session;
     }
 
@@ -1976,24 +2228,33 @@ async function handleCommand(
 
     default:
       log(`❌ 未知命令: /${cmd}，输入 /? 查看帮助`);
-      log("可用命令: new load ls del p f s history sys rj t think raw auth reauth cd ?,h help q quit clear pwd");
+      log("可用命令: new load ls del p f s history sys rj t think search m up raw auth reauth cd ?,h help q quit clear pwd");
       return session;
   }
 }
 
-function displayEvent(event: ParseEvent, rawMode: boolean): void {
-  // 原始模式：text_delta 直接输出，其他事件忽略
+function displayEvent(event: ParseEvent, rawMode: boolean, thinkingActive: boolean): boolean {
+  // 原始模式：直接输出 text_delta，透传 error
   if (rawMode) {
     if (event.type === "text_delta") process.stdout.write(event.content);
-    return;
+    else if (event.type === "error") console.error(`\n❌ ${event.message}`);
+    return thinkingActive;
   }
 
   switch (event.type) {
     case "text_delta":
+      if (thinkingActive) {
+        thinkingActive = false
+        process.stdout.write("\n\n💬:\n")
+      }
       process.stdout.write(event.content);
       break;
     case "thinking_delta":
-      process.stdout.write(`\x1b[36m${event.content}\x1b[0m`);
+      if (!thinkingActive) {
+        thinkingActive = true
+        process.stdout.write(`\n💭 Thinking:\n`)
+      }
+      process.stdout.write(event.content);
       break;
     case "tool_call_end":
       console.log(`\n🔧 执行工具: ${event.name} ✅`);
@@ -2014,14 +2275,19 @@ function displayEvent(event: ParseEvent, rawMode: boolean): void {
     default:
       break;
   }
+  return thinkingActive;
 }
 
-function getPrompt(session: ChatSession | null): string {
+function getPrompt(session: ChatSession | null, rawMode: boolean = false): string {
   if (!session) return "💬 新会话 > ";
   const title = session.title || "新会话";
-  const thinkIcon = session.thinkEnabled ? " 🧠" : "";
+  const thinkIcon = session.thinkEnabled ? " 💭" : "";
   const searchIcon = session.searchEnabled ? " 🔍" : "";
-  return `💬 ${title}${thinkIcon}${searchIcon} > `;
+  const toolIcon = session.isToolEnabled ? " 🔧" : "";
+  const rawIcon = rawMode ? " 📶" : "";
+  const modelMap: Record<string, string> = { default: "⚡", expert: "💎", vision: "👁" };
+  const modelIcon = modelMap[session.modelType] || "";
+  return `💬 ${title}${thinkIcon}${searchIcon}${toolIcon}${rawIcon}${modelIcon} > `;
 }
 
 function switchWorkspace(
@@ -2039,7 +2305,10 @@ function switchWorkspace(
   const env = scanDeepseekDir(newDir);
   console.log(`\n📂 工作目录已切换: ${newDir}`);
   console.log(`📋 提示词状态：`);
-  console.log(`   🔹 系统提示词（${env.systemSource === "local" ? "局部" : env.systemSource === "global" ? "全局" : "无"}）${env.systemPrompt ? ` ✅ (${env.systemPrompt.length} 字)` : ""}`);
+  console.log(`   🔹 System:              ${env.systemPrompt ? `✅ ${env.systemSource === "local" ? "局部" : "全局"} (${env.systemPrompt.length} 字)` : "(未找到)"}`);
+  console.log(`   🔹 Skill:               ${env.skillMdContent ? `✅ 自定义 (${env.skillMdContent.length} 字)` : "(未找到)"}`);
+  console.log(`   🔹 Tool:                ${env.toolMdContent ? `✅ 默认 + 自定义 (${env.toolMdContent.length} 字)` : "(默认)"}`);
+  console.log(`   🔹 Think:               ${env.thinkMdContent ? `✅ 自定义 (${env.thinkMdContent.length} 字)` : "(默认)"}`);
 
   // 恢复新目录会话
   const currentId = newStore.getCurrentId();
@@ -2055,6 +2324,9 @@ function switchWorkspace(
     newStore.setCurrentId(newSession.sessionId);
   }
   newSession.setSystemPrompt(env.systemPrompt);
+  if (env.thinkMdContent) newSession.setThinkInjectionPrompt(env.thinkMdContent);
+  if (env.toolMdContent) newSession.setToolMdContent(env.toolMdContent);
+  if (env.skillMdContent) newSession.setSkillMdContent(env.skillMdContent);
   // 不自动注入工具提示词
 
   return { env, session: newSession };
@@ -2089,9 +2361,10 @@ async function startRepl(): Promise<void> {
   const env = scanDeepseekDir(workDir);
   console.log(`📂 工作目录: ${workDir}`);
   console.log(`📋 提示词状态：`);
-  console.log(`   🔹 系统提示词（${env.systemSource === "local" ? "局部" : env.systemSource === "global" ? "全局" : "无"}）${env.systemPrompt ? ` ✅ (${env.systemPrompt.length} 字)` : ""}`);
-  console.log(`   🔹 Skill 提示词:      ${env.skillMdContent ? `✅ (${env.skillMdContent.length} 字)` : "(未找到)"}`);
-  console.log(`   🔹 Tool 提示词:       ${env.toolMdContent ? `✅ (${env.toolMdContent.length} 字)` : "(未找到)"}`);
+  console.log(`   🔹 System:              ${env.systemPrompt ? `✅ ${env.systemSource === "local" ? "局部" : "全局"} (${env.systemPrompt.length} 字)` : "(未找到)"}`);
+  console.log(`   🔹 Skill:               ${env.skillMdContent ? `✅ 自定义 (${env.skillMdContent.length} 字)` : "(未找到)"}`);
+  console.log(`   🔹 Tool:                ${env.toolMdContent ? `✅ 默认 + 自定义 (${env.toolMdContent.length} 字)` : "(默认)"}`);
+  console.log(`   🔹 Think:               ${env.thinkMdContent ? `✅ 自定义 (${env.thinkMdContent.length} 字)` : "(默认)"}`);
   console.log();
 
   // 恢复或创建会话
@@ -2111,6 +2384,9 @@ async function startRepl(): Promise<void> {
     console.log("");
   }
   session.setSystemPrompt(env.systemPrompt);
+  if (env.thinkMdContent) session.setThinkInjectionPrompt(env.thinkMdContent);
+  if (env.toolMdContent) session.setToolMdContent(env.toolMdContent);
+  if (env.skillMdContent) session.setSkillMdContent(env.skillMdContent);
 
   // REPL 状态
   let deleteSubMode = false;
@@ -2118,53 +2394,52 @@ async function startRepl(): Promise<void> {
   let confirmQuit = false;
   let roomRecoveryMsg: string | null = null;
   let pendingAction: string | null = null;
-  let historyOn = true;
   const messageQueue: string[] = [];
   let isSending = false;
+
+  const ctx: ReplCtx = { client, store, promptBuilder, toolRegistry: registry, toolExecutor: executor, creds, workDir, rl: null as any, rawMode: false };
 
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: getPrompt(session),
+    prompt: getPrompt(session, ctx.rawMode),
   });
+  ctx.rl = rl;
 
   session.setRl(rl);
-
-  const ctx: ReplCtx = { client, store, promptBuilder, toolRegistry: registry, toolExecutor: executor, creds, workDir, rl, rawMode: false };
 
   // 删除子模式处理函数
   const handleDeleteInput = async (input: string) => {
     const trimmed = input.trim();
     if (trimmed === "q" || trimmed === "/q") {
       deleteSubMode = false;
+      rl.setPrompt(getPrompt(session, ctx.rawMode));
       console.log("已退出删除模式");
       return;
     }
     if (trimmed === "all") {
-      console.log("⚠️ 将删除全部会话，确认？(y/n)");
-      rl.pause();
       const answer = await new Promise<string>((resolve) => {
-        process.stdin.once("data", (buf) => resolve(buf.toString().trim().toLowerCase()));
+        rl.question("⚠️ 将删除全部会话，确认？(y/n) ", (ans) => resolve(ans.trim().toLowerCase()));
       });
-      rl.resume();
       if (answer === "y" || answer === "yes") {
-        const list = store.list();
-        for (const s of list) { store.delete(s.id); }
-        if (session && !store.load(session.sessionId)) session = null;
+        const list = ctx.store.list();
+        for (const s of list) { ctx.store.delete(s.id); }
+        if (session && !ctx.store.load(session.sessionId)) session = null;
         console.log(`✅ 已删除全部 ${list.length} 个会话`);
         deleteSubMode = false;
+        rl.setPrompt(getPrompt(session, ctx.rawMode));
       }
       return;
     }
     const idx = parseInt(trimmed, 10);
-    const list = store.list();
+    const list = ctx.store.list();
     if (isNaN(idx) || idx < 1 || idx > list.length) {
       console.log("❌ 无效输入，请输入序号、或 a（全部删除）、或 q（退出）");
       rl.prompt();
       return;
     }
     const target = list[idx - 1];
-    store.delete(target.id);
+    ctx.store.delete(target.id);
     if (session && session.sessionId === target.id) session = null;
     console.log(`✅ 已删除 ${target.id} - ${target.title}`);
   };
@@ -2172,15 +2447,23 @@ async function startRepl(): Promise<void> {
   // 消息队列处理
   const processQueue = async () => {
     if (isSending || !session) return;
+    let firstMsg = true;
     while (messageQueue.length > 0) {
       isSending = true;
       const msg = messageQueue.shift()!;
+
+      // 第一条消息输入行已由 readline 显示，队列中的后续消息需手动回显
+      if (!firstMsg) {
+        process.stdout.write(getPrompt(session, ctx.rawMode) + msg + "\n");
+      }
+      firstMsg = false;
 
       let needRetry = true;
       let retryCount = 0;
       while (needRetry && retryCount < 2) {
         needRetry = false;
         process.stdout.write("\n");
+        let thinkingActive = false;
         for await (const event of session.send(msg, ctx.rawMode)) {
           if (event.type === "room_recovery") {
             const hint = event.historyRounds > 0 ? `（含 ${event.historyRounds} 轮历史）` : "";
@@ -2204,9 +2487,10 @@ async function startRepl(): Promise<void> {
             }
             break;
           }
-          displayEvent(event, ctx.rawMode);
+          thinkingActive = displayEvent(event, ctx.rawMode, thinkingActive);
         }
       }
+
       console.log();
     }
     isSending = false;
@@ -2216,7 +2500,7 @@ async function startRepl(): Promise<void> {
   process.on("SIGINT", () => {
     if (session) {
       session.save();
-      store.setCurrentId(session.sessionId);
+      ctx.store.setCurrentId(session.sessionId);
     }
     console.log("\n👋 再见");
     process.exit(0);
@@ -2227,7 +2511,7 @@ async function startRepl(): Promise<void> {
     if (confirmQuit) {
       const answer = line.trim().toLowerCase();
       if (answer === "y" || answer === "yes") {
-        if (session) { session.save(); store.setCurrentId(session.sessionId); }
+        if (session) { session.save(); ctx.store.setCurrentId(session.sessionId); }
         console.log("👋 再见");
         rl.close();
         process.exit(0);
@@ -2235,7 +2519,7 @@ async function startRepl(): Promise<void> {
       }
       console.log("已取消");
       confirmQuit = false;
-      rl.setPrompt(getPrompt(session));
+      rl.setPrompt(getPrompt(session, ctx.rawMode));
       rl.prompt();
       return;
     }
@@ -2247,7 +2531,15 @@ async function startRepl(): Promise<void> {
       roomRecoveryMsg = null;
       if (answer !== "y" && answer !== "yes") {
         console.log("已取消");
-        rl.setPrompt(getPrompt(session));
+        // 回滚 send 方法中已推入的空回复 user 消息
+        if (session && session.messages.length > 0) {
+          const lastMsg = session.messages[session.messages.length - 1];
+          if (lastMsg.role === "user" && lastMsg.content === msg) {
+            session.messages.pop();
+            session.save();
+          }
+        }
+        rl.setPrompt(getPrompt(session, ctx.rawMode));
         rl.prompt();
         return;
       }
@@ -2256,40 +2548,45 @@ async function startRepl(): Promise<void> {
         if (!session) { session = ChatSession.create(client, store, promptBuilder, executor); }
         const newId = await client.createChatSession();
         session.setId(newId);
-        store.setCurrentId(newId);
+        ctx.store.setCurrentId(newId);
         // 构建包含历史 + 当前消息的首轮 prompt
         const historyParts: string[] = [];
         const env = scanDeepseekDir(ctx.workDir);
         session.setSystemPrompt(env.systemPrompt);
+        if (env.thinkMdContent) session.setThinkInjectionPrompt(env.thinkMdContent);
+        if (env.toolMdContent) session.setToolMdContent(env.toolMdContent);
+        if (env.skillMdContent) session.setSkillMdContent(env.skillMdContent);
         for (const m of session.messages) {
           historyParts.push(`${m.role === "user" ? "User" : "Assistant"}: ${m.content}`);
         }
         historyParts.push(`User: ${msg}`);
         const fullPrompt = historyParts.join("\n\n");
         session.setParentMessageId(null);
+        const parentIdSnapshot = session.parentMessageId;
         // 发送
         const stream = await client.chat(newId, null, fullPrompt,
-          session.thinkEnabled, session.searchEnabled);
+          session.thinkEnabled, session.searchEnabled, session.modelType);
         const parser = new StreamParser();
         let assistantText = "";
         process.stdout.write("\n");
+        let thinkingActive = false;
         for await (const event of parser.parse(stream)) {
           if (event.type === "text_delta" || event.type === "thinking_delta") {
             assistantText += event.content;
-            displayEvent(event, ctx.rawMode);
+            thinkingActive = displayEvent(event, ctx.rawMode, thinkingActive);
           } else if (event.type === "message_id") {
             session.setParentMessageId(event.id);
           } else if (event.type === "title") {
             session.setTitle(event.title);
           }
         }
-        session.pushUserAndAssistantMessages(msg, assistantText);
+        session.pushUserAndAssistantMessages(msg, assistantText, parentIdSnapshot);
         session.touch();
         session.save();
       } catch (err: any) {
         console.error(`\n❌ 重建房间失败: ${err.message}`);
       }
-      rl.setPrompt(getPrompt(session));
+      rl.setPrompt(getPrompt(session, ctx.rawMode));
       rl.prompt();
       return;
     }
@@ -2301,7 +2598,7 @@ async function startRepl(): Promise<void> {
       const answer = line.trim().toLowerCase();
       if (answer !== "y" && answer !== "yes") {
         console.log("已取消");
-        rl.setPrompt(getPrompt(session));
+        rl.setPrompt(getPrompt(session, ctx.rawMode));
         rl.prompt();
         return;
       }
@@ -2314,16 +2611,16 @@ async function startRepl(): Promise<void> {
         const mode = action.slice(10) as "new" | "keep";
         session!.setReinjectMode(mode);
         const env = scanDeepseekDir(ctx.workDir);
-        const promptLen = env.systemPrompt.length + registry.buildToolPrompt().length;
+        const promptLen = env.systemPrompt.length + env.toolMdContent.length + env.skillMdContent.length + registry.buildToolPrompt().length;
         console.log(`🔄 下次消息将重新注入提示词（共 ${promptLen} 字，模式：${mode === "new" ? "-new" : "-keep"}）`);
       } else if (action.startsWith("DEL_SINGLE:")) {
         const id = action.slice(11);
-        const target = store.load(id);
-        store.delete(id);
+        const target = ctx.store.load(id);
+        ctx.store.delete(id);
         if (session && session.sessionId === id) session = null;
         console.log(`✅ 已删除 ${id} - ${target?.title || ""}`);
       }
-      rl.setPrompt(getPrompt(session));
+      rl.setPrompt(getPrompt(session, ctx.rawMode));
       rl.prompt();
       return;
     }
@@ -2334,19 +2631,21 @@ async function startRepl(): Promise<void> {
       // / 开头的输入当作命令处理，退出子模式
       if (input.startsWith("/")) {
         loadSubMode = false;
+        rl.setPrompt(getPrompt(session, ctx.rawMode));
         // 不做 return，让后续命令处理器接管
       } else if (input === "q") {
         loadSubMode = false;
+        rl.setPrompt(getPrompt(session, ctx.rawMode));
         console.log("已退出加载模式");
         rl.prompt();
         return;
       } else {
         const idx = parseInt(input, 10);
-        const list = store.list();
+        const list = ctx.store.list();
         if (isNaN(idx) || idx < 1 || idx > list.length) {
           console.log("❌ 无效序号");
           loadSubMode = false;
-          rl.setPrompt(getPrompt(session));
+          rl.setPrompt(getPrompt(session, ctx.rawMode));
           rl.prompt();
           return;
         }
@@ -2360,7 +2659,7 @@ async function startRepl(): Promise<void> {
           console.log(`📎 已切换到：${loaded.sessionId} - ${loaded.title} (${loaded.messageCount} 轮)`);
         }
         loadSubMode = false;
-        rl.setPrompt(getPrompt(session));
+        rl.setPrompt(getPrompt(session, ctx.rawMode));
         console.log("");
         rl.prompt();
         return;
@@ -2387,11 +2686,12 @@ async function startRepl(): Promise<void> {
       // /del /delete /del --all: 进入删除子模式
       const delParts = trimmed.slice(1).trim().split(/\s+/);
       if ((delParts[0] === "del" || delParts[0] === "delete") && (delParts.length === 1 || delParts[1] === "--all")) {
-        const list = store.list();
+        const list = ctx.store.list();
         if (list.length === 0) {
           console.log("暂无保存的会话");
         } else {
           deleteSubMode = true;
+          rl.setPrompt("🗑️ 删除 > ");
           console.log("\n🗑️ 删除会话管理");
           console.log("   输入序号删除 | all 全部 | q 退出\n");
           list.forEach((s, i) => {
@@ -2421,6 +2721,7 @@ async function startRepl(): Promise<void> {
             session = prevSession;
           } else if (result.type === "load_interactive") {
             loadSubMode = true;
+            rl.setPrompt("📎 加载 > ");
             session = prevSession;
           } else if (result.type === "cd_switched") {
             const sw = switchWorkspace(result.dir, session, ctx);
@@ -2440,7 +2741,7 @@ async function startRepl(): Promise<void> {
       if (!command) { rl.prompt(); return; }
       const cwdBefore = process.cwd();
       try {
-        execSync(command, { stdio: "inherit" });
+        execSync(command, { stdio: "inherit", timeout: 60000 });
       } catch (err: any) {
         console.log(`❌ 命令执行失败: ${err.message}`);
       }
@@ -2457,27 +2758,32 @@ async function startRepl(): Promise<void> {
     else if (session) {
       if (!session.sessionId) {
         // 首次发消息确保 _current 更新
-        store.setCurrentId(""); // will be set when lazily created
+        ctx.store.setCurrentId(""); // 首次发送后惰性创建时更新
       }
       messageQueue.push(trimmed);
       if (messageQueue.length > 1) {
         console.log("⏳ AI 回复中，消息已排队");
       }
       await processQueue();
+      if (isSending) return;
     } else {
       session = ChatSession.create(client, store, promptBuilder, executor);
       session.setSystemPrompt(env.systemPrompt);
+      if (env.thinkMdContent) session.setThinkInjectionPrompt(env.thinkMdContent);
+      if (env.toolMdContent) session.setToolMdContent(env.toolMdContent);
+      if (env.skillMdContent) session.setSkillMdContent(env.skillMdContent);
       // 不自动注入工具提示词，避免干扰内置搜索
       messageQueue.push(trimmed);
       await processQueue();
+      if (isSending) return;
     }
 
     // 更新提示符（确认/删除子模式时不覆盖）
     if (!confirmQuit && !pendingAction && !deleteSubMode && !loadSubMode && !roomRecoveryMsg && !ctx.rawMode) {
-      rl.setPrompt(getPrompt(session));
+      rl.setPrompt(getPrompt(session, ctx.rawMode));
     }
     if (!ctx.rawMode) console.log("");
-    if (!ctx.rawMode) rl.prompt();
+    rl.prompt();
   });
 
   rl.prompt();

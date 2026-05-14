@@ -1,0 +1,12 @@
+请各位订户立即更新所有 Linux 设备的安全补丁、系统内核：
+这次爆出的 Copy Fail (CVE-2026-31431) 是一个 非常严重 的极高危 Linux 内核恶性提权漏洞, 影响 2017 年发布以来几乎所有 Linux 发行版
+刚好和同为恶性提权漏洞 Dirty COW (脏牛, CVE-2016-5195) 在影响面上直接续上了: 2007—2016 的发行版本可以用 CVE-2016-5195, 2017-2027 可以用 CVE-2026-31431
+这个漏洞甚至比脏牛的利用门槛还更低、利用成功率更高，后者需要利用 Linux 内存子系统中的条件竞争特性，有时候利用时还会出现 Kernel Panic, 而前者的 PoC 成功率几乎就是 100%
+时间线:
+此漏洞最初由 Xint 研究员于 2026-03-23 发现，修复补丁已于 04-01 合并入 Linux 内核 mainline, 而漏洞的 PoC 已按流程于今日 (04-30) 公开。
+由于 SSH/OpenSSL 等安全基建库几乎都在使用自行维护的用户态加密库, 所以 AF_ALG 可以直接禁用, 临时缓解措施 (仅供参考):
+rmmod algif_aead 2>/dev/null || true
+echo "install algif_aead /bin/false" > /etc/modprobe.d/disable-algif.conf
+src: Xint (PoC & 技术报告) | Linux Kernel - Patch | cve.org | Ubuntu | Debian
+
+from HAT's Public Channel | 🫪

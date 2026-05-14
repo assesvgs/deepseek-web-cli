@@ -1,0 +1,68 @@
+近日有网友发现
+BiliBili 的视频（格式）广告内容也来自一些特殊的官方工作账号
+此类账号具有以下特征：
+1. 英文数字账号
+2. 0 级小号
+3. 投稿视频数量几千到几十万不等
+4. 用户主页不显示任何投稿内容和动态
+
+通过将这些官方广告工作账号加入黑名单即可屏蔽大量贴片广告、切后台广告，缓解开屏广告/视频广告等
+
+目前已知广告工作账号列表如下：
+https://space.bilibili.com/1042653845
+https://space.bilibili.com/1055149070
+https://space.bilibili.com/1064488621 （主要）
+https://space.bilibili.com/1075400468
+https://space.bilibili.com/1148923121
+https://space.bilibili.com/1152997930
+https://space.bilibili.com/1188004959
+https://space.bilibili.com/1208114979
+https://space.bilibili.com/1227735707
+https://space.bilibili.com/1252039983
+https://space.bilibili.com/1257852431
+https://space.bilibili.com/1284878163
+https://space.bilibili.com/1296541829
+https://space.bilibili.com/1302669433
+https://space.bilibili.com/1303123946
+https://space.bilibili.com/1346091659
+https://space.bilibili.com/1356882480 （主要）
+https://space.bilibili.com/1430439192
+https://space.bilibili.com/1577437924
+https://space.bilibili.com/1627242161
+https://space.bilibili.com/1630491103
+https://space.bilibili.com/1642531925
+https://space.bilibili.com/1655279349
+https://space.bilibili.com/1714908508
+https://space.bilibili.com/1720634591
+https://space.bilibili.com/1734012280
+https://space.bilibili.com/1743345026
+https://space.bilibili.com/1798118517
+https://space.bilibili.com/1806922031
+https://space.bilibili.com/1817661914
+https://space.bilibili.com/1826766269
+https://space.bilibili.com/1859459400
+https://space.bilibili.com/1919627194
+https://space.bilibili.com/1919873485
+https://space.bilibili.com/1926952280
+https://space.bilibili.com/1956866386
+https://space.bilibili.com/1957313739 (pdd)
+https://space.bilibili.com/1987938455 （主要）
+https://space.bilibili.com/1992873935
+https://space.bilibili.com/2024349971
+https://space.bilibili.com/2067273601
+https://space.bilibili.com/2072500476
+https://space.bilibili.com/2101682498
+https://space.bilibili.com/2103756604 （主要）
+https://space.bilibili.com/2115931056
+https://space.bilibili.com/2118239887
+https://space.bilibili.com/2126699792
+
+如何找到更多广告工作账号？
+Google 搜索输入⬇️
+site:bilibili.com intitle:别家素材
+搜索结果都是广告视频及其账号
+
+延伸阅读
+https://www.zhihu.com/question/640923460/answer/1968440919704438741
+
+#BiliUniverse #BiliBili
