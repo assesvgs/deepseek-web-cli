@@ -37,6 +37,10 @@ npm install playwright-core
 
 # 2. 启动 REPL（首次运行会自动触发登录流程）
 ./chat.ts
+
+# 3. 或使用 bun 效率更高（自动安装 playwright-core 相关依赖）
+npm install -g bun
+bun run ./chat.ts
 ```
 
 如果凭证缺失或过期，chat.ts 会在启动时自动通过 Chrome DevTools Protocol 捕获 cookie 和 bearer token，保存到 `credentials.json`。已登录状态下直接进入 REPL。
